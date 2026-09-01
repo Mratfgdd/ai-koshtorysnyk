@@ -1,0 +1,61 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# In Render: New -> Blueprint -> pick this repo. Everything below is applied
+# automatically; only ANTHROPIC_API_KEY has to be typed in.
+#
+# Free tier notes:
+#   * the instance sleeps after ~15 min idle and takes ~50 s to wake;
+#   * the disk is ephemeral unless a Disk is attached (see below), so uploads
+#     and the SQLite database are lost on redeploy without one.
+
+services:
+  - type: web
+    name: koshtorysnyk-api
+    runtime: python
+    plan: free
+    region: frankfurt          # closest Render region to Ukraine
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    # Render injects $PORT; binding to 0.0.0.0 is required.
+    startCommand: >-
+      python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+
+      # Set this in the Render dashboard (Environment -> Add Secret File is not
+      # needed; a plain env var is enough). Marked sync:false so it is never
+      # written into the repo.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      - key: AI_MODEL
+        value: claude-opus-5
+      - key: AI_EFFORT
+        value: high
+      - key: AI_MAX_CONCURRENCY
+        value: "4"              # free tier has little CPU; keep concurrency low
+      - key: MAX_VISION_PAGES
+        value: "40"
+      - key: MAX_UPLOAD_MB
+        value: "80"             # free tier request/disk limits
+
+      # Any *.vercel.app origin is allowed by default (see config.py); add your
+      # custom domain here, comma-separated, when you have one.
+      - key: CORS_ORIGINS
+        value: ""
+
+      # Persist the database and uploads on the attached disk.
+      - key: DATA_DIR
+        value: /var/data
+      - key: DATABASE_URL
+        value: sqlite:////var/data/estimator.db
+
+    # 1 GB free persistent disk. Without it every redeploy wipes projects.
+    disk:
+      name: koshtorysnyk-data
+      mountPath: /var/data
+      sizeGB: 1

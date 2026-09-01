@@ -1,0 +1,836 @@
+"""Orchestration: documents -> object analysis -> estimate -> validation.
+
+This module is the only place that knows the order of the steps. Each step is
+recorded on a :class:`JobRun` so a long analysis is observable and, because
+every page result is cached, resumable.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..config import get_settings
+from ..models import (
+    Document,
+    DocumentPage,
+    Estimate,
+    JobRun,
+    ObjectAnalysis,
+    Project,
+    Question,
+)
+from ..schemas import EstimateCreate
+from .ai.analyzer import DocumentAnalyzer
+from .ai.schemas import (
+    clean_confidence,
+    clean_fact_status,
+    clean_question_kind,
+    clean_section,
+    clean_source_type,
+)
+from .ai.client import AIClient
+from .catalog.search import CatalogSearch, stem_overlap
+from .docs.pdf_extract import extract_document
+from .estimate.builder import EstimateBuilder, TemplateLayout
+from .estimate.store import draft_from_estimate, group_by_section, save_draft
+from .rules.engine import normalize_name
+from .validation.validators import validate
+
+log = logging.getLogger(__name__)
+settings = get_settings()
+
+
+# --- job bookkeeping ---------------------------------------------------------
+
+
+def _start_job(session: Session, project_id: int, kind: str) -> JobRun:
+    job = JobRun(
+        project_id=project_id,
+        kind=kind,
+        status="running",
+        started_at=dt.datetime.now(dt.timezone.utc),
+    )
+    session.add(job)
+    session.commit()
+    return job
+
+
+def _progress(session: Session, job: JobRun):
+    def report(fraction: float, step: str) -> None:
+        job.progress = round(max(0.0, min(1.0, fraction)), 3)
+        job.step = step[:200]
+        session.commit()
+
+    return report
+
+
+def _finish(session: Session, job: JobRun, status: str, detail: dict[str, Any], error: str | None = None) -> None:
+    job.status = status
+    job.detail = detail
+    job.error = error
+    job.progress = 1.0 if status == "done" else job.progress
+    job.finished_at = dt.datetime.now(dt.timezone.utc)
+    session.commit()
+
+
+# --- step 1: analyse documents ----------------------------------------------
+
+
+def analyse_project(session: Session, project: Project) -> dict[str, Any]:
+    """Extract, triage, analyse and fuse every document into an object model."""
+    job = _start_job(session, project.id, "analyze")
+    report = _progress(session, job)
+    report(0.02, "Читання документів")
+
+    documents: list[tuple[Any, str]] = []
+    for document in project.documents:
+        try:
+            extracted = extract_document(document.stored_path)
+            documents.append((extracted, document.filename))
+            _sync_pages(session, document, extracted)
+        except Exception as exc:  # noqa: BLE001
+            document.status = "error"
+            document.error = repr(exc)
+            session.commit()
+            log.exception("extract failed: %s", document.filename)
+
+    if not documents:
+        _finish(session, job, "error", {}, "Жоден документ не вдалося прочитати.")
+        return {"status": "error", "message": "Жоден документ не вдалося прочитати."}
+
+    analyzer = DocumentAnalyzer(AIClient(settings), settings)
+    outcome = analyzer.analyse_documents(
+        documents, brief=project.brief or "", on_progress=report
+    )
+
+    _store_page_findings(session, project, outcome)
+
+    if outcome.analysis is None:
+        _finish(
+            session,
+            job,
+            "error",
+            {"errors": outcome.errors, "skipped": outcome.skipped, "usage": outcome.usage},
+            "; ".join(outcome.errors) or "Аналіз не сформовано.",
+        )
+        return {
+            "status": "error",
+            "message": "Не вдалося сформувати аналіз об'єкта.",
+            "errors": outcome.errors,
+            "skipped": outcome.skipped,
+        }
+
+    analysis = _store_analysis(session, project, outcome)
+    _store_questions(session, project, outcome)
+
+    _finish(
+        session,
+        job,
+        "done",
+        {
+            "pages_analysed": len([p for p in outcome.pages if p.findings]),
+            "pages_failed": len([p for p in outcome.pages if p.error]),
+            "skipped": outcome.skipped,
+            "usage": outcome.usage,
+            "errors": outcome.errors,
+        },
+    )
+    project.status = "analysed"
+    session.commit()
+
+    return {
+        "status": "ok",
+        "analysis_id": analysis.id,
+        "job_id": job.id,
+        "pages_analysed": len([p for p in outcome.pages if p.findings]),
+        "skipped": outcome.skipped,
+        "errors": outcome.errors,
+        "usage": outcome.usage,
+    }
+
+
+def _sync_pages(session: Session, document: Document, extracted: Any) -> None:
+    existing = {p.page_number: p for p in document.pages}
+    for page in extracted.pages:
+        row = existing.get(page.page_number)
+        if row is None:
+            row = DocumentPage(document_id=document.id, page_number=page.page_number)
+            session.add(row)
+        row.page_hash = page.page_hash
+        row.text = page.text[:200_000]
+        row.text_length = page.text_length
+        row.image_count = page.image_count
+        row.tables = page.tables[:6]
+        row.page_type = page.page_type
+        row.needs_vision = page.needs_vision
+    document.page_count = extracted.page_count
+    document.kind = extracted.kind
+    document.status = "extracted"
+    session.commit()
+
+
+def _store_page_findings(session: Session, project: Project, outcome: Any) -> None:
+    by_number: dict[int, DocumentPage] = {}
+    for document in project.documents:
+        for page in document.pages:
+            by_number.setdefault(page.page_number, page)
+
+    for result in outcome.pages:
+        page = by_number.get(result.page_number)
+        if page is None:
+            continue
+        if result.findings is not None:
+            page.findings = result.findings.model_dump(mode="json")
+            page.confidence = result.findings.confidence
+            page.analysed = True
+    session.commit()
+
+
+def _store_analysis(session: Session, project: Project, outcome: Any) -> ObjectAnalysis:
+    previous = session.scalars(
+        select(ObjectAnalysis)
+        .where(ObjectAnalysis.project_id == project.id)
+        .order_by(ObjectAnalysis.version.desc())
+        .limit(1)
+    ).first()
+    result = outcome.analysis
+
+    # The aggregate schema takes plain strings for the enum-like fields (see
+    # ai/schemas.py); normalise them here so nothing downstream sees a value
+    # outside the template's own vocabulary.
+    facts = []
+    for f in result.facts:
+        data = f.model_dump(mode="json")
+        data["status"] = clean_fact_status(data.get("status", ""))
+        data["confidence"] = clean_confidence(data.get("confidence", ""))
+        data["source_type"] = clean_source_type(data.get("source_type", ""))
+        data["section"] = clean_section(data.get("section", ""))
+        facts.append(data)
+
+    systems = []
+    for s in result.systems:
+        data = s.model_dump(mode="json")
+        key = clean_section(data.get("key", ""))
+        if key is None:
+            # A section the template does not have cannot be estimated; keep it
+            # visible as a risk rather than silently dropping or inventing it.
+            result.risks.append(
+                f"Модель визначила систему «{data.get('label') or data.get('key')}», "
+                "якої немає у шаблоні кошторису — потрібне рішення користувача."
+            )
+            continue
+        data["key"] = key
+        data["confidence"] = clean_confidence(data.get("confidence", ""))
+        systems.append(data)
+
+    plants = []
+    for p in result.plants:
+        data = p.model_dump(mode="json")
+        data["confidence"] = clean_confidence(data.get("confidence", ""))
+        plants.append(data)
+
+    coverage = []
+    for c in result.coverage:
+        data = c.model_dump(mode="json")
+        data["section"] = clean_section(data.get("section", ""))
+        data["confidence"] = clean_confidence(data.get("confidence", ""))
+        coverage.append(data)
+
+    analysis = ObjectAnalysis(
+        project_id=project.id,
+        version=(previous.version + 1) if previous else 1,
+        status="draft",
+        object_type=result.object_type,
+        summary=result.summary,
+        facts=facts,
+        systems=systems,
+        plants=plants,
+        components=coverage,
+        assumptions=list(result.assumptions),
+        unknowns=list(result.unknowns),
+        risks=list(result.risks),
+        conflicts=[c.model_dump(mode="json") for c in result.conflicts],
+    )
+    session.add(analysis)
+    session.commit()
+    session.refresh(analysis)
+    return analysis
+
+
+def _store_questions(session: Session, project: Project, outcome: Any) -> None:
+    existing = {
+        q.code
+        for q in session.scalars(select(Question).where(Question.project_id == project.id)).all()
+    }
+    for question in outcome.analysis.questions:
+        if question.code in existing:
+            continue
+        session.add(
+            Question(
+                project_id=project.id,
+                group=question.group or "general",
+                code=question.code,
+                text=question.text,
+                why=question.why,
+                kind=clean_question_kind(question.kind),
+                choices=list(question.choices),
+                affects=list(question.affects),
+            )
+        )
+    for conflict in outcome.analysis.conflicts:
+        code = f"conflict:{normalize_name(conflict.topic)[:80]}"
+        if code in existing:
+            continue
+        session.add(
+            Question(
+                project_id=project.id,
+                group="conflicts",
+                code=code,
+                text=conflict.question or f"Оберіть правильне значення: {conflict.topic}",
+                why="Джерела дають різні значення: " + "; ".join(conflict.values),
+                kind="choice",
+                choices=list(conflict.values),
+                affects=[conflict.impact],
+            )
+        )
+    session.commit()
+
+
+# --- step 2: plan and build --------------------------------------------------
+
+
+def plan_and_build(
+    session: Session, project: Project, payload: EstimateCreate
+) -> dict[str, Any]:
+    """Turn the object analysis into a priced, validated draft estimate."""
+    job = _start_job(session, project.id, "estimate")
+    report = _progress(session, job)
+    report(0.05, "Підготовка даних")
+
+    layout = TemplateLayout.load()
+    builder = EstimateBuilder(session, layout)
+
+    analysis = session.scalars(
+        select(ObjectAnalysis)
+        .where(ObjectAnalysis.project_id == project.id)
+        .order_by(ObjectAnalysis.version.desc())
+        .limit(1)
+    ).first()
+
+    sections = list(payload.sections)
+    quantities = {k: dict(v) for k, v in payload.quantities.items()}
+    plants = list(payload.plants)
+    notes: list[str] = []
+
+    if analysis is not None:
+        derived = _from_analysis(analysis, layout, session)
+        sections = sections or derived["sections"]
+        for key, values in derived["quantities"].items():
+            quantities.setdefault(key, {}).update(
+                {k: v for k, v in values.items() if k not in quantities.get(key, {})}
+            )
+        plants = plants or derived["plants"]
+        notes.extend(derived["notes"])
+        _questions_from_coverage(session, project, derived.get("unresolved", []))
+
+    if not sections:
+        _finish(session, job, "error", {}, "Не визначено жодної секції кошторису.")
+        return {
+            "status": "error",
+            "message": (
+                "Не визначено, які секції потрібні. Заповніть аналіз об'єкта "
+                "або вкажіть секції вручну."
+            ),
+        }
+
+    report(0.35, "Підбір позицій та розрахунок")
+    result = builder.build(
+        sections=sections,
+        quantities=quantities,
+        plants=plants,
+        options=payload.options,
+        settings={**(project.settings or {}), **payload.settings},
+    )
+
+    report(0.75, "Перевірка кошторису")
+    open_questions = [
+        {"text": q.text, "why": q.why, "affects": q.affects or []}
+        for q in session.scalars(
+            select(Question).where(
+                Question.project_id == project.id, Question.status == "open"
+            )
+        ).all()
+    ]
+    validation = validate(
+        result.draft,
+        result.totals,
+        {
+            "catalog_units": _catalog_units(session),
+            "open_questions": open_questions,
+            "conflicts": (analysis.conflicts or []) if analysis else [],
+        },
+    )
+
+    previous = session.scalars(
+        select(Estimate)
+        .where(Estimate.project_id == project.id)
+        .order_by(Estimate.version.desc())
+        .limit(1)
+    ).first()
+    estimate = Estimate(
+        project_id=project.id,
+        analysis_id=analysis.id if analysis else None,
+        version=(previous.version + 1) if previous else 1,
+        status="draft",
+    )
+    session.add(estimate)
+    session.commit()
+    session.refresh(estimate)
+
+    candidates = {
+        entry["name"]: entry["candidates"] for entry in result.ambiguous if entry.get("candidates")
+    }
+    save_draft(
+        session,
+        estimate,
+        result.draft,
+        result.totals,
+        section_titles=layout.titles(),
+        candidates=candidates,
+        report=validation,
+    )
+    _questions_from_build(session, project, estimate, result, layout)
+
+    _finish(
+        session,
+        job,
+        "done",
+        {
+            "estimate_id": estimate.id,
+            "sections": sections,
+            "unmatched": len(result.unmatched),
+            "ambiguous": len(result.ambiguous),
+        },
+    )
+    project.status = "estimated"
+    session.commit()
+
+    return {
+        "status": "ok",
+        "estimate_id": estimate.id,
+        "job_id": job.id,
+        "totals": estimate.totals,
+        "sections": group_by_section(estimate.lines),
+        "validation": validation.to_dict(),
+        "unmatched": result.unmatched,
+        "ambiguous": result.ambiguous,
+        "notes": notes + result.notes,
+    }
+
+
+def _from_analysis(
+    analysis: ObjectAnalysis, layout: TemplateLayout, session: Session
+) -> dict[str, Any]:
+    """Read sections, drivers and plants out of the stored object analysis.
+
+    Only values the analysis actually carries are used. Anything missing stays
+    missing so it surfaces as a question rather than as a silent default.
+    """
+    sections = [s.get("key") for s in (analysis.systems or []) if s.get("key")]
+    sections = [s for s in sections if s in layout.sections]
+
+    quantities: dict[str, dict[str, float]] = {}
+    notes: list[str] = []
+    unresolved: list[dict[str, Any]] = []
+
+    driver_names = {
+        key: {normalize_name(d): d for d in layout.drivers(key)} for key in layout.order
+    }
+
+    for fact in analysis.facts or []:
+        if fact.get("status") in ("unknown", "needs_user_input"):
+            continue
+        value = _as_float(fact.get("value"))
+        if value is None:
+            continue
+        target_section = fact.get("section")
+        label = normalize_name(str(fact.get("label", "")))
+        for key, drivers in driver_names.items():
+            if target_section and key != target_section:
+                continue
+            for norm, original in drivers.items():
+                if norm == label or label in norm or norm in label:
+                    quantities.setdefault(key, {})[original] = value
+                    if key not in sections:
+                        sections.append(key)
+
+    search = CatalogSearch(session)
+    for entry in analysis.components or []:
+        name = str(entry.get("name", "")).strip()
+        value = _as_float(entry.get("quantity"))
+        section = entry.get("section")
+        unit = str(entry.get("unit", "")).strip()
+        if not name or value is None:
+            continue
+        if section not in layout.sections:
+            section = _guess_section(name, layout)
+        if section is None:
+            unresolved.append({"name": name, "value": value, "unit": unit,
+                               "reason": "не визначено, до якої секції належить позиція"})
+            continue
+
+        target, kind, reason = _resolve_coverage_target(name, unit, section, layout, search)
+        if target is None:
+            unresolved.append({"name": name, "value": value, "unit": unit,
+                               "section": section, "reason": reason})
+            notes.append(f"«{name}» ({value:g} {unit}) — {reason}")
+            continue
+
+        quantities.setdefault(section, {})[target] = value
+        if section not in sections:
+            sections.append(section)
+        notes.append(f"«{name}» → «{target}» ({kind}), {value:g} {unit}.")
+
+    plants = [
+        {
+            "name": p.get("name", ""),
+            "quantity": _as_float(p.get("quantity")),
+            "is_existing": bool(p.get("is_existing")),
+            "reason": p.get("note", ""),
+        }
+        for p in (analysis.plants or [])
+        if p.get("name")
+    ]
+    if plants and "planting" not in sections:
+        sections.append("planting")
+
+    return {
+        "sections": [s for s in layout.order if s in sections],
+        "quantities": quantities,
+        "plants": plants,
+        "notes": notes,
+        "unresolved": unresolved,
+    }
+
+
+# Which section a coverage row belongs to, when the model did not say. Keyed on
+# the vocabulary the client's own drawings use.
+_SECTION_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("lawn", ("газон", "рулон", "посівн", "конюшин")),
+    ("paving", ("бруків", "поребрик", "бордюр 1000", "замощен", "тротуарн")),
+    ("pathway", ("плит", "терасн", "доріжк", "настил")),
+    ("geogrid", ("георешіт",)),
+    ("planting", ("кора", "крихт", "мульч", "агрополотн", "агроволокн", "клумб",
+                  "бордюр", "декор", "рослин")),
+    ("planters", ("кашпо",)),
+    ("irrigation", ("полив", "дощувач", "крапельн")),
+    ("lighting", ("світильник", "освітлен", "ліхтар")),
+    ("drainage_ground", ("дренаж",)),
+    ("drainage_storm", ("водовідвед", "дощоприйм", "лоток")),
+    ("fire_zone", ("вогн", "кострищ")),
+]
+
+
+def _guess_section(name: str, layout: TemplateLayout) -> str | None:
+    low = normalize_name(name)
+    for key, markers in _SECTION_HINTS:
+        if key in layout.sections and any(m in low for m in markers):
+            return key
+    return None
+
+
+def _resolve_coverage_target(
+    name: str,
+    unit: str,
+    section: str,
+    layout: TemplateLayout,
+    search: CatalogSearch,
+) -> tuple[str | None, str, str]:
+    """Map a coverage-schedule row onto a template row.
+
+    A drawing says "Газон 259 м²"; the template wants that number in its input
+    row "Площа газону (рулонного)". A drawing says "Плити ходові бетонні 37 шт";
+    the template wants the catalog article. So we try the section's own driver
+    rows first, then the catalog.
+
+    Returns ``(target_row_name, kind, reason)``. A ``None`` target is never a
+    silent drop -- the caller records it and raises a question.
+    """
+    # 1. A driver row of this section. Stem comparison, because a schedule says
+    #    "Газон" where the template row is "Площа газону (рулонного)".
+    best_driver: tuple[float, str] | None = None
+    for driver in layout.drivers(section):
+        score = stem_overlap(name, driver)
+        if best_driver is None or score > best_driver[0]:
+            best_driver = (score, driver)
+    if best_driver and best_driver[0] >= 0.75:
+        return best_driver[1], "рядок-драйвер шаблону", ""
+
+    # 2. A catalog article. The template itself says which section an article
+    #    belongs to, so a confident match in another section is placed there
+    #    rather than refused.
+    match = search.match(name)
+    if match.status == "matched" and match.best is not None:
+        candidate = match.best.item
+        home = _section_of_article(candidate.name, layout)
+        if home is None:
+            return (
+                None,
+                "",
+                f"позиція «{candidate.name}» не входить у жодну секцію шаблону",
+            )
+        if unit and normalize_name(candidate.unit) != normalize_name(unit):
+            return (
+                None,
+                "",
+                (
+                    f"одиниці не збігаються: у кресленні «{unit}», у каталозі "
+                    f"«{candidate.unit}» ({candidate.name}) — потрібне перерахування, "
+                    "система його не вигадує"
+                ),
+            )
+        kind = "позиція каталогу"
+        if home != section:
+            kind = f"позиція каталогу, секція «{layout.title(home)}»"
+        return candidate.name, kind, ""
+
+    if match.status == "ambiguous":
+        options = ", ".join(c.item.name for c in match.candidates[:3])
+        return None, "", f"кілька відповідників у каталозі ({options}) — потрібен вибір"
+
+    return None, "", "позиції немає в каталозі під цією назвою"
+
+
+def _section_of_article(name: str, layout: TemplateLayout) -> str | None:
+    """Which template section contains this article."""
+    key = normalize_name(name)
+    for section in layout.order:
+        if section == "summary":
+            continue
+        for line in layout.lines(section):
+            if line["block"] != "driver" and normalize_name(line["name"]) == key:
+                return section
+    return None
+
+
+def _questions_from_coverage(
+    session: Session, project: Project, unresolved: list[dict[str, Any]]
+) -> None:
+    """A quantity read off a drawing that we could not place is never dropped."""
+    if not unresolved:
+        return
+    existing = {
+        q.code
+        for q in session.scalars(select(Question).where(Question.project_id == project.id)).all()
+    }
+    for entry in unresolved:
+        code = f"coverage:{normalize_name(entry['name'])[:90]}"
+        if code in existing:
+            continue
+        qty = entry.get("value")
+        unit = entry.get("unit", "")
+        session.add(
+            Question(
+                project_id=project.id,
+                group="Відомість покриттів",
+                code=code,
+                text=(
+                    f"Куди віднести «{entry['name']}» ({qty:g} {unit}) з відомості покриттів?"
+                    if qty is not None
+                    else f"Куди віднести «{entry['name']}» з відомості покриттів?"
+                ),
+                why=(
+                    f"Кількість прочитана з креслення, але {entry.get('reason', 'не зіставлена')}. "
+                    "Без цього позиція не потрапить у кошторис."
+                ),
+                kind="text",
+                affects=[entry.get("section", "")],
+            )
+        )
+    session.commit()
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("\xa0", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _catalog_units(session: Session) -> dict[str, str]:
+    from ..models import CatalogItem
+
+    rows = session.execute(
+        select(CatalogItem.name_norm, CatalogItem.unit).where(CatalogItem.active.is_(True))
+    ).all()
+    return {name: unit for name, unit in rows if unit}
+
+
+def _questions_from_build(
+    session: Session,
+    project: Project,
+    estimate: Estimate,
+    result: Any,
+    layout: TemplateLayout,
+) -> None:
+    """Turn unresolved matches and empty option toggles into grouped questions."""
+    existing = {
+        q.code
+        for q in session.scalars(select(Question).where(Question.project_id == project.id)).all()
+    }
+
+    for entry in result.ambiguous:
+        code = f"match:{normalize_name(entry['name'])[:90]}"
+        if code in existing:
+            continue
+        session.add(
+            Question(
+                project_id=project.id,
+                estimate_id=estimate.id,
+                group="Вибір позиції каталогу",
+                code=code,
+                text=f"Яку позицію використати замість «{entry['name']}»?",
+                why=entry["reason"],
+                kind="choice",
+                choices=[c["name"] for c in entry.get("candidates", [])[:5]],
+                affects=[entry["section"]],
+            )
+        )
+
+    for entry in result.unmatched:
+        code = f"missing:{normalize_name(entry['name'])[:90]}"
+        if code in existing:
+            continue
+        session.add(
+            Question(
+                project_id=project.id,
+                estimate_id=estimate.id,
+                group="Позиції поза каталогом",
+                code=code,
+                text=f"Позиції «{entry['name']}» немає в каталозі. Чим її замінити?",
+                why=entry["reason"],
+                kind="text",
+                affects=[entry["section"]],
+            )
+        )
+
+    # Plants matched but unpriced: the client's base carries no plant prices.
+    for line in result.draft.lines:
+        if line.block != "plants" or line.quantity <= 0 or line.unit_price > 0:
+            continue
+        code = f"price:{normalize_name(line.name)[:90]}"
+        if code in existing:
+            continue
+        session.add(
+            Question(
+                project_id=project.id,
+                estimate_id=estimate.id,
+                group="Ціни рослин",
+                code=code,
+                text=f"Яка ціна за 1 шт для «{line.name}»?",
+                why=(
+                    "У базі клієнта для рослин ціни не ведуться — вони визначаються "
+                    "за прайсом розсадника на конкретний проєкт."
+                ),
+                kind="number",
+                affects=["planting"],
+            )
+        )
+
+    session.commit()
+
+
+# --- step 3: answers and recalculation --------------------------------------
+
+
+def apply_answer(session: Session, estimate: Estimate, question: Question) -> None:
+    """Apply one answer to the estimate it affects."""
+    answer = (question.answer or "").strip()
+    if not answer:
+        return
+
+    if question.code.startswith("price:"):
+        target = question.code[len("price:"):]
+        for line in estimate.lines:
+            if normalize_name(line.name).startswith(target):
+                price = _as_float(answer)
+                if price is not None:
+                    line.unit_price = price
+                    line.total = round(line.quantity * price, 2)
+                    line.reasons = list(line.reasons or []) + [
+                        "Ціну внесено користувачем у відповідь на питання."
+                    ]
+        session.commit()
+        return
+
+    if question.code.startswith("match:"):
+        target = question.code[len("match:"):]
+        item = CatalogSearch(session).get_exact(answer)
+        if item is None:
+            return
+        for line in estimate.lines:
+            if normalize_name(line.name).startswith(target):
+                line.catalog_id = item.id
+                line.name = item.name
+                line.unit = item.unit
+                line.unit_price = item.unit_price
+                line.unit_cost = item.unit_cost
+                line.total = round(line.quantity * item.unit_price, 2)
+                line.match_status = "matched"
+                line.confidence = "high"
+                line.reasons = list(line.reasons or []) + [
+                    "Позицію обрано користувачем у відповідь на питання."
+                ]
+        session.commit()
+        return
+
+    # Anything else is recorded; the operator applies it through the estimate UI.
+
+
+def recalculate_estimate(session: Session, estimate: Estimate) -> dict[str, Any]:
+    """Re-run rules, totals and validation over the current stored lines."""
+    layout = TemplateLayout.load()
+    builder = EstimateBuilder(session, layout)
+
+    session.refresh(estimate)
+    draft = draft_from_estimate(estimate)
+    result = builder.recalculate(draft, estimate.settings)
+
+    open_questions = [
+        {"text": q.text, "why": q.why, "affects": q.affects or []}
+        for q in session.scalars(
+            select(Question).where(
+                Question.project_id == estimate.project_id, Question.status == "open"
+            )
+        ).all()
+    ]
+    validation = validate(
+        result.draft,
+        result.totals,
+        {"catalog_units": _catalog_units(session), "open_questions": open_questions},
+    )
+    save_draft(
+        session,
+        estimate,
+        result.draft,
+        result.totals,
+        section_titles=layout.titles(),
+        report=validation,
+    )
+    return {
+        "status": "ok",
+        "estimate_id": estimate.id,
+        "totals": estimate.totals,
+        "sections": group_by_section(estimate.lines),
+        "validation": validation.to_dict(),
+    }

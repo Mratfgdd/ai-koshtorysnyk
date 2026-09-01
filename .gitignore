@@ -1,0 +1,22 @@
+﻿# data & generated artefacts
+data/
+frontend/dist/
+frontend/node_modules/
+backend/app/data/rules/needs_review.json
+
+# secrets
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
