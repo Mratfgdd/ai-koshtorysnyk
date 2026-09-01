@@ -11,7 +11,7 @@
 #     from sleep. The bundled catalog seed reloads automatically, so the app
 #     always comes back usable -- but finished estimates must be exported to
 #     XLSX before the instance sleeps. For real persistence, either upgrade to
-#     a paid plan and re-add a `disk:` block with DATA_DIR=/var/data, or point
+#     a paid plan and attach a persistent volume (see docs/DEPLOY.md), or point
 #     DATABASE_URL at a managed Postgres.
 
 services:
