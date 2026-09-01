@@ -174,6 +174,71 @@ def test_storage_paths_follow_data_dir(tmp_path: Path) -> None:
     assert other.cache_dir == tmp_path / "cache"
 
 
+def test_no_content_routes_declare_no_body() -> None:
+    """A 204 handler must not carry a response model.
+
+    FastAPI infers the response model from the return annotation, so a plain
+    `-> None` yields NoneType — a body — and the route is rejected while the
+    module is still being imported:
+
+        AssertionError: Status code 204 must not have a response body
+
+    That is an import-time failure, so the whole service refuses to boot, not
+    just the one endpoint. Newer FastAPI tolerates it; the version we deploy
+    does not.
+    """
+    from fastapi.routing import APIRoute
+
+    no_content = [
+        r for r in app.routes
+        if isinstance(r, APIRoute) and r.status_code == 204
+    ]
+    assert no_content, "expected at least one 204 route"
+    for route in no_content:
+        assert route.response_model is None, (
+            f"{route.path} returns 204 but declares a response model "
+            f"({route.response_model!r}); annotate it `-> Response`"
+        )
+        assert route.response_class.__name__ == "Response", (
+            f"{route.path} should use response_class=Response"
+        )
+
+
+def test_installed_packages_match_requirements() -> None:
+    """The pins must describe the environment the suite actually runs in.
+
+    requirements.txt was written from memory once and drifted from the local
+    environment by ten packages, so nothing here exercised what Render
+    installed — and the deploy broke on a FastAPI assertion the local version
+    does not raise.
+    """
+    import importlib.metadata as md
+    import re
+
+    text = (ROOT / "backend" / "requirements.txt").read_text(encoding="utf-8")
+    mismatches: list[str] = []
+    for line in text.splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        m = re.match(r"^([A-Za-z0-9_.\-]+)(?:\[[^\]]+\])?==(.+)$", line)
+        if not m:
+            continue  # a range spec; not pinned to one version on purpose
+        name, want = m.group(1), m.group(2).strip()
+        try:
+            have = md.version(name)
+        except md.PackageNotFoundError:
+            mismatches.append(f"{name}: pinned {want}, not installed")
+            continue
+        if have != want:
+            mismatches.append(f"{name}: pinned {want}, installed {have}")
+
+    assert not mismatches, (
+        "requirements.txt does not describe this environment, so the suite is "
+        "not testing what gets deployed:\n  " + "\n  ".join(mismatches)
+    )
+
+
 def test_shipped_data_is_not_gitignored() -> None:
     """The three files a deployment cannot start without must reach the repo.
 

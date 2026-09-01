@@ -13,7 +13,15 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -239,10 +247,16 @@ def update_project(project_id: int, payload: ProjectUpdate, session: Session = D
     return _project_dict(project)
 
 
-@router.delete("/projects/{project_id}", status_code=204)
-def delete_project(project_id: int, session: Session = Depends(get_session)) -> None:
+# 204 means "no content", so the handler must return an empty Response and the
+# route must declare it. A `-> None` annotation makes FastAPI infer NoneType as
+# the response model, and it then refuses the route outright:
+#   AssertionError: Status code 204 must not have a response body
+# Newer FastAPI tolerates it; 0.115.x does not, which is what we deploy.
+@router.delete("/projects/{project_id}", status_code=204, response_class=Response)
+def delete_project(project_id: int, session: Session = Depends(get_session)) -> Response:
     session.delete(_project(session, project_id))
     session.commit()
+    return Response(status_code=204)
 
 
 # --- documents ---------------------------------------------------------------
@@ -361,14 +375,15 @@ def document_triage(document_id: int, session: Session = Depends(get_session)):
         raise HTTPException(500, f"Не вдалося прочитати документ: {exc}") from exc
 
 
-@router.delete("/documents/{document_id}", status_code=204)
-def delete_document(document_id: int, session: Session = Depends(get_session)) -> None:
+@router.delete("/documents/{document_id}", status_code=204, response_class=Response)
+def delete_document(document_id: int, session: Session = Depends(get_session)) -> Response:
     document = session.get(Document, document_id)
     if document is None:
         raise HTTPException(404, "Документ не знайдено")
     Path(document.stored_path).unlink(missing_ok=True)
     session.delete(document)
     session.commit()
+    return Response(status_code=204)
 
 
 # --- analysis ----------------------------------------------------------------

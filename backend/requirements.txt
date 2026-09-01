@@ -1,14 +1,29 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-sqlalchemy==2.0.36
-pydantic==2.10.4
-pydantic-settings==2.7.0
+# Pinned to the versions this code is actually tested against.
+#
+# These were previously written from memory and drifted from the local
+# environment by ten packages, so the test suite never exercised what the
+# deployment installed. FastAPI 0.119 tolerates a `-> None` handler on a 204
+# route; 0.115.6 refuses it at import time, and the service would not boot.
+# Regenerate with: pip freeze, or bump deliberately and re-run the suite.
+
+fastapi==0.119.1
+uvicorn[standard]==0.37.0
+starlette==0.48.0
+sqlalchemy==2.0.52
+pydantic==2.12.0
+pydantic-settings==2.15.0
 python-multipart==0.0.20
-anthropic>=0.42.0
-pymupdf==1.25.1
+
+# Major-pinned: anthropic 1.x moved to httpx2 and changed client internals.
+# An unbounded `>=0.42.0` let the deploy pull 1.3.0 while tests ran on 1.2.0.
+anthropic>=1.2.0,<2.0.0
+
+pymupdf==1.28.2
 openpyxl==3.1.5
-rapidfuzz==3.11.0
-Pillow==11.1.0
+Pillow==12.2.0
+rapidfuzz==3.14.6
 httpx==0.28.1
-pytest==8.3.4
-PyYAML==6.0.2
+
+# test-only
+pytest==8.4.2
+PyYAML==6.0.3
