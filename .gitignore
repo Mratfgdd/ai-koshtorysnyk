@@ -1,8 +1,17 @@
-﻿# data & generated artefacts
-data/
-frontend/dist/
-frontend/node_modules/
-backend/app/data/rules/needs_review.json
+# Runtime data only. Patterns are anchored with a leading slash on purpose:
+# a bare `data/` also matches `backend/app/data/`, which would exclude the
+# compiled rule pack, the catalog seed and the logo — the three things a
+# deployment cannot start without.
+/data/
+/backend/data/
+*.db
+*.db-wal
+*.db-shm
+
+# generated, not source
+/frontend/dist/
+/frontend/node_modules/
+/backend/app/data/rules/needs_review.json
 
 # secrets
 .env

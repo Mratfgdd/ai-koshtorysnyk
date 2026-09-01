@@ -5,8 +5,14 @@
 #
 # Free tier notes:
 #   * the instance sleeps after ~15 min idle and takes ~50 s to wake;
-#   * the disk is ephemeral unless a Disk is attached (see below), so uploads
-#     and the SQLite database are lost on redeploy without one.
+#   * persistent disks are a paid feature ("disks are not supported for free
+#     tier services"), so storage here is EPHEMERAL: projects, uploaded PDFs
+#     and the SQLite database are wiped on every redeploy, restart and wake
+#     from sleep. The bundled catalog seed reloads automatically, so the app
+#     always comes back usable -- but finished estimates must be exported to
+#     XLSX before the instance sleeps. For real persistence, either upgrade to
+#     a paid plan and re-add a `disk:` block with DATA_DIR=/var/data, or point
+#     DATABASE_URL at a managed Postgres.
 
 services:
   - type: web
@@ -48,14 +54,9 @@ services:
       - key: CORS_ORIGINS
         value: ""
 
-      # Persist the database and uploads on the attached disk.
+      # Ephemeral storage, relative to rootDir (/opt/render/project/src/backend).
+      # Uploads and the page cache follow DATA_DIR automatically.
       - key: DATA_DIR
-        value: /var/data
+        value: ./data
       - key: DATABASE_URL
-        value: sqlite:////var/data/estimator.db
-
-    # 1 GB free persistent disk. Without it every redeploy wipes projects.
-    disk:
-      name: koshtorysnyk-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: sqlite:///./estimator.db

@@ -134,9 +134,79 @@ def test_render_yaml_binds_the_platform_port() -> None:
 
     env = {e["key"]: e for e in service["envVars"]}
     assert env["ANTHROPIC_API_KEY"].get("sync") is False, "the key must not live in git"
-    assert service["disk"]["mountPath"] == env["DATA_DIR"]["value"], (
-        "the database must sit on the persistent disk"
-    )
+
+
+def test_render_free_tier_declares_no_disk() -> None:
+    """Render rejects a Blueprint with a disk on the free plan.
+
+    "services[0] disks are not supported for free tier services" — so a free
+    service must declare none, and its storage paths must be writable ones
+    rather than a disk mount point that will not exist.
+    """
+    spec = yaml.safe_load((ROOT / "render.yaml").read_text(encoding="utf-8"))
+    service = spec["services"][0]
+    env = {e["key"]: e["value"] for e in service["envVars"] if "value" in e}
+
+    if service.get("plan") == "free":
+        assert "disk" not in service, "free tier services cannot declare a disk"
+        assert not env["DATA_DIR"].startswith("/var/data"), (
+            "/var/data only exists when a disk is mounted"
+        )
+        assert "/var/data" not in env["DATABASE_URL"]
+    else:
+        assert service["disk"]["mountPath"] == env["DATA_DIR"]
+
+
+def test_storage_paths_follow_data_dir(tmp_path: Path) -> None:
+    """DATA_DIR must move uploads and the cache with it.
+
+    Otherwise pointing it at /tmp or a disk leaves PDFs and rendered pages
+    behind in the source tree, where the deploy cannot rely on them.
+    """
+    s = Settings(data_dir=tmp_path)
+    assert s.upload_dir == tmp_path / "uploads"
+    assert s.cache_dir == tmp_path / "cache"
+    assert s.page_image_dir == tmp_path / "pages"
+
+    # An explicit override still wins.
+    other = Settings(data_dir=tmp_path, upload_dir=tmp_path / "custom")
+    assert other.upload_dir == tmp_path / "custom"
+    assert other.cache_dir == tmp_path / "cache"
+
+
+def test_shipped_data_is_not_gitignored() -> None:
+    """The three files a deployment cannot start without must reach the repo.
+
+    A bare `data/` rule matches `backend/app/data/` as well, which silently
+    excluded the rule pack, the catalog seed and the logo — the deploy would
+    boot with zero rules and an empty catalog.
+    """
+    import subprocess
+
+    must_ship = [
+        "backend/app/data/rules/template_layout.json",
+        "backend/app/data/seed/catalog.json",
+        "backend/app/data/brand/logo.png",
+        "render.yaml",
+        "frontend/vercel.json",
+    ]
+    must_not_ship = [".env", "data/estimator.db", "backend/estimator.db"]
+
+    def ignored(path: str) -> bool:
+        return subprocess.run(
+            ["git", "check-ignore", "-q", path], cwd=ROOT, capture_output=True
+        ).returncode == 0
+
+    try:
+        subprocess.run(["git", "--version"], capture_output=True, check=True)
+    except (OSError, subprocess.CalledProcessError):  # pragma: no cover
+        pytest.skip("git unavailable")
+
+    for path in must_ship:
+        if (ROOT / path).exists():
+            assert not ignored(path), f"{path} is gitignored but the deploy needs it"
+    for path in must_not_ship:
+        assert ignored(path), f"{path} must never be committed"
 
 
 def test_vercel_json_serves_the_spa() -> None:

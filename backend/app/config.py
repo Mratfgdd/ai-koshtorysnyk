@@ -9,6 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -50,11 +51,27 @@ class Settings(BaseSettings):
         return r"https://.*\.vercel\.app" if self.cors_allow_vercel else None
 
     # --- storage -------------------------------------------------------------
+    # Only DATA_DIR normally needs setting: the sub-directories follow it unless
+    # they are given explicitly. Without that, pointing DATA_DIR at a mounted
+    # disk (or /tmp) would silently leave uploads and the page cache behind in
+    # the source tree.
     data_dir: Path = PROJECT_ROOT / "data"
     database_url: str = ""
     upload_dir: Path = PROJECT_ROOT / "data" / "uploads"
     cache_dir: Path = PROJECT_ROOT / "data" / "cache"
     page_image_dir: Path = PROJECT_ROOT / "data" / "pages"
+
+    @model_validator(mode="after")
+    def _derive_storage_paths(self) -> "Settings":
+        explicit = self.model_fields_set
+        for field, name in (
+            ("upload_dir", "uploads"),
+            ("cache_dir", "cache"),
+            ("page_image_dir", "pages"),
+        ):
+            if field not in explicit:
+                object.__setattr__(self, field, self.data_dir / name)
+        return self
 
     # --- rule pack -----------------------------------------------------------
     rules_dir: Path = BACKEND_DIR / "app" / "data" / "rules"
