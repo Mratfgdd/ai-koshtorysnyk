@@ -1,0 +1,36 @@
+[Unit]
+Description=AI Кошторисник — FastAPI backend (uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=estimator
+Group=estimator
+WorkingDirectory=/opt/estimator/src/backend
+# Settings come from /opt/estimator/src/.env, which pydantic-settings reads
+# relative to the project root; no EnvironmentFile needed.
+Environment=PYTHONUNBUFFERED=1
+# One worker on purpose: the store is SQLite in WAL mode, and concurrent
+# writers from several processes would hit "database is locked" during an
+# analysis run. Request concurrency comes from FastAPI's threadpool, and the
+# pipeline parallelises page analysis internally via AI_MAX_CONCURRENCY.
+ExecStart=/opt/estimator/venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 \
+    --workers 1 \
+    --proxy-headers --forwarded-allow-ips=127.0.0.1 \
+    --timeout-keep-alive 75
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Hardening. The data directory is the only writable path the app needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/estimator
+
+[Install]
+WantedBy=multi-user.target
