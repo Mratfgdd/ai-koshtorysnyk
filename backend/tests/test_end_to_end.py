@@ -322,6 +322,53 @@ def test_export_produces_a_readable_workbook(built, tmp_path) -> None:
     assert "qty(" in audit
 
 
+def test_export_sums_survive_without_recalculation(built, tmp_path) -> None:
+    """Every sum must be readable without Excel recalculating the workbook.
+
+    openpyxl writes `<f>SUM(...)</f><v/>` — a formula with an empty cached
+    result. Excel recalculates on load and looked fine; LibreOffice, Google
+    Sheets, any preview, and `data_only=True` all read that empty cache and
+    showed a proposal whose every total was blank.
+    """
+    import openpyxl
+
+    from app.services.export.xlsx import LAST_COL
+
+    out = export_estimate(
+        tmp_path / "cached.xlsx",
+        built.draft,
+        built.totals,
+        meta=ExportMeta(client_name="Галина", address="с. Будьків"),
+        section_titles={"pathway": "Доріжка", "planting": "Озеленення", "lawn": "Газон"},
+        section_order=SECTIONS,
+    )
+
+    live = openpyxl.load_workbook(out)["Кошторис"]
+    cached = openpyxl.load_workbook(out, data_only=True)["Кошторис"]
+
+    blank: list[str] = []
+    checked = 0
+    for row in range(1, live.max_row + 1):
+        formula = live.cell(row, LAST_COL).value
+        if not (isinstance(formula, str) and formula.startswith("=")):
+            continue
+        checked += 1
+        value = cached.cell(row, LAST_COL).value
+        if value is None or value == "":
+            label = live.cell(row, 1).value or live.cell(row, 2).value
+            blank.append(f"F{row} ({label})")
+
+    assert checked > 5, "no formula cells found — the export stopped writing sums"
+    assert not blank, f"sums blank without recalculation: {blank}"
+
+    # Line sums and their subtotals must agree.
+    for row in range(1, live.max_row + 1):
+        qty, price = cached.cell(row, 3).value, cached.cell(row, 5).value
+        total = cached.cell(row, LAST_COL).value
+        if isinstance(live.cell(row, 1).value, int) and None not in (qty, price, total):
+            assert abs(total - qty * price) < 0.011, f"row {row}: {total} != {qty} × {price}"
+
+
 def test_export_matches_the_reference_proposal_styling(built, tmp_path) -> None:
     """Palette, columns and branding are taken from the issued Budkiv proposal."""
     import openpyxl

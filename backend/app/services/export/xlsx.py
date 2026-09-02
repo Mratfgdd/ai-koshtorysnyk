@@ -26,6 +26,10 @@ customer.
 from __future__ import annotations
 
 import datetime as dt
+import math
+import re
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,9 +68,27 @@ FILL_WARN = PatternFill("solid", fgColor="FEF3E2")
 THIN = Side(style="thin", color="A6A6A6")
 BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-# Accounting format, as in the source proposal: space-grouped, em dash for zero.
-MONEY = r'_-* # ##0.00_-;-* # ##0.00_-;_-* "—"_-;_-@_-'
-QTY = '# ##0.###;-# ##0.###;"—"'
+# Rules that close a "Разом …" row: a plain one for block subtotals, a heavier
+# one for a section total and the final invoice figures.
+RULE = Side(style="thin", color=INK)
+RULE_STRONG = Side(style="double", color=GREEN)
+
+# Number formats.
+#
+# The grouping separator in a format code is the comma token `,` — Excel and
+# LibreOffice render it in the viewer's locale (a space in uk-UA). The previous
+# codes grouped with a *literal* space (`# ##0.00`), which is not the grouping
+# token: the leading `#` matched nothing, the literal space was emitted anyway,
+# and small numbers came out as " 5" or "5," depending on the renderer.
+#
+# The em dash for an exact zero is kept: it is the convention in the client's
+# own issued proposal. It was never the cause of the blank totals — those were
+# formulas with no cached result, which is fixed in _inject_cached_values.
+MONEY = '#,##0.00;-#,##0.00;"—"'
+# Currency is spelled out on the summary lines only; repeating ₴ in every cell
+# of a 70-row proposal is noise, and it is what makes columns overflow to ###.
+MONEY_STRONG = '#,##0.00\\ "₴";-#,##0.00\\ "₴";"—"'
+QTY = '#,##0.###;-#,##0.###;"—"'
 
 FONT = "Calibri"
 
@@ -79,10 +101,139 @@ SUBTOTAL_LABELS = {
 }
 
 HEADERS = ["#", "Матеріали", "К-сть", "Од. вим.", "Ціна", "Сума"]
+# Floor and ceiling for the auto-fit. Column B wraps, so it is pinned: letting
+# it grow to the longest article name would push Ціна and Сума off the page.
 WIDTHS = [5, 58, 10, 12, 12, 16]
+MAX_WIDTHS = [6, 58, 14, 14, 20, 22]
 
 # The proposal is portrait A4; content stops at column F.
 LAST_COL = 6
+
+
+class _Formulas:
+    """Every formula written to the workbook, with the number it evaluates to.
+
+    openpyxl has no formula engine: it writes ``<f>SUM(F20:F22)</f><v/>`` — a
+    formula whose *cached result is empty*. Excel recalculates on load and shows
+    the right number, which is why this went unnoticed. Nothing else does:
+    LibreOffice and Google Sheets honour the empty cache, a PDF or thumbnail
+    preview shows blanks, and ``load_workbook(data_only=True)`` — the obvious
+    way to verify the file — returns ``None`` for every sum in the document.
+
+    So each formula is recorded here with the value it evaluates to, and the
+    cache is filled in after the workbook is saved. The formulas stay live, so
+    changing a quantity in the delivered file still updates the totals.
+    """
+
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], float] = {}
+
+    def write(
+        self,
+        ws: Worksheet,
+        row: int,
+        col: int,
+        formula: str,
+        value: float,
+        number_format: str = MONEY,
+    ):
+        cell = ws.cell(row, col)
+        cell.value = f"={formula}"
+        cell.number_format = number_format
+        self.values[(ws.title, cell.coordinate)] = float(value)
+        return cell
+
+    def at(self, ws: Worksheet, row: int, col: int = LAST_COL) -> float:
+        """What the formula already written in that cell evaluates to.
+
+        The summary rolls up rows the section writer produced, so it reads the
+        amounts back from here instead of recomputing them from the draft and
+        risking a total that disagrees with the rows above it.
+        """
+        return self.values.get((ws.title, f"{get_column_letter(col)}{row}"), 0.0)
+
+
+# openpyxl writes a formula cell as `<f>…</f>` followed by an empty `<v/>`
+# (or `<v></v>`); anything else is left alone.
+#
+# `[^>/]` in the attributes, not `[^>]`, so an empty self-closing cell —
+# `<c r="B22" s="17"/>`, which openpyxl emits for the placeholders inside a
+# merged range — cannot match. With `[^>]` the `/` was swallowed as an
+# attribute, the body then ran on to the *next* cell's `</c>`, and the sum in
+# column F of every merged "Разом …" row was hidden inside that match and never
+# patched. Cell attributes are only r/s/t, so none of them contains a slash.
+_CELL_RE = re.compile(rb'<c r="(?P<ref>[A-Z]+[0-9]+)"(?P<attrs>[^>/]*)>(?P<body>.*?)</c>', re.S)
+_EMPTY_V_RE = re.compile(rb"<v\s*/>|<v></v>")
+
+
+def _num(value: float) -> bytes:
+    """Excel stores raw numbers; trim float noise without changing the value."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return (text or "0").encode("ascii")
+
+
+def _sheet_files(zf: zipfile.ZipFile) -> dict[str, str]:
+    """Map worksheet name -> its XML path, via the workbook relationships."""
+    ns = {
+        "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+    rels = {
+        rel.get("Id"): rel.get("Target")
+        for rel in ET.fromstring(zf.read("xl/_rels/workbook.xml.rels")).findall("pr:Relationship", ns)
+    }
+    out: dict[str, str] = {}
+    for sheet in ET.fromstring(zf.read("xl/workbook.xml")).findall("m:sheets/m:sheet", ns):
+        target = rels.get(sheet.get(f"{{{ns['r']}}}id"), "")
+        if target:
+            out[sheet.get("name", "")] = "xl/" + target.lstrip("/").removeprefix("xl/")
+    return out
+
+
+def _inject_cached_values(path: Path, fx: _Formulas) -> None:
+    """Fill in the cached result of every formula openpyxl left empty."""
+    if not fx.values:
+        return
+
+    with zipfile.ZipFile(path) as zf:
+        members = zf.infolist()
+        content = {m.filename: zf.read(m.filename) for m in members}
+        sheet_files = _sheet_files(zf)
+
+    for title, cell_values in _by_sheet(fx.values).items():
+        name = sheet_files.get(title)
+        if name is None or name not in content:  # pragma: no cover - defensive
+            continue
+
+        def patch(match: "re.Match[bytes]") -> bytes:
+            ref = match.group("ref").decode("ascii")
+            value = cell_values.get(ref)
+            body = match.group("body")
+            # Only numeric formula cells; never touch a shared-string cell.
+            if value is None or b"<f" not in body or b't="s"' in match.group("attrs"):
+                return match.group(0)
+            cached = b"<v>" + _num(value) + b"</v>"
+            body = _EMPTY_V_RE.sub(cached, body) if _EMPTY_V_RE.search(body) else body + cached
+            return (
+                b'<c r="' + match.group("ref") + b'"' + match.group("attrs") + b">"
+                + body
+                + b"</c>"
+            )
+
+        content[name] = _CELL_RE.sub(patch, content[name])
+
+    # Rewrite the archive: zipfile cannot replace a member in place.
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for member in members:
+            out.writestr(member, content[member.filename])
+
+
+def _by_sheet(values: dict[tuple[str, str], float]) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    for (title, ref), value in values.items():
+        out.setdefault(title, {})[ref] = value
+    return out
 
 
 @dataclass
@@ -121,9 +272,11 @@ def export_estimate(
     ws.title = "Кошторис"
 
     flags = _severity_by_line(report)
+    fx = _Formulas()
     row = _write_header(ws, meta)
 
-    anchors: list[tuple[str, int, int]] = []  # (title, materials_row, works_row)
+    # (title, row carrying the materials subtotal, row carrying the works one)
+    anchors: list[tuple[str, int, int]] = []
 
     for key in _sections_in_order(draft, order):
         lines = [
@@ -133,14 +286,14 @@ def export_estimate(
         if not lines:
             continue
         title = titles.get(key, key)
-        row, material_anchor, works_row = _write_section(ws, row, title, lines, flags)
+        row, material_anchor, works_row = _write_section(ws, row, title, lines, flags, fx)
         anchors.append((title, material_anchor, works_row))
         row += 1
 
-    row = _write_summary(ws, row, anchors, totals)
+    row = _write_summary(ws, row, anchors, totals, fx)
     _write_footer(ws, row + 1)
 
-    _finish_sheet(ws)
+    _finish_sheet(ws, fx)
     _write_audit_sheet(wb, draft, report)
     if report and report.findings:
         _write_issue_sheet(wb, report)
@@ -149,6 +302,8 @@ def export_estimate(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
+    # Must come after save(): openpyxl rewrites the whole archive.
+    _inject_cached_values(path, fx)
     return path
 
 
@@ -229,6 +384,7 @@ def _write_section(
     title: str,
     lines: list[DraftLine],
     flags: dict[str, str],
+    fx: _Formulas,
 ) -> tuple[int, int, int]:
     label = title if title.lower().startswith(("підготовчий", "рахунок")) else f"Рахунок {title}"
 
@@ -253,6 +409,7 @@ def _write_section(
     row += 1
 
     subtotals: dict[str, int] = {}
+    amounts: dict[str, float] = {}
     for block in sorted({l.block for l in lines}, key=lambda b: BLOCK_ORDER.get(b, 9)):
         block_lines = [l for l in lines if l.block == block]
         if not block_lines:
@@ -260,11 +417,12 @@ def _write_section(
         row = _write_table_header(ws, row, BLOCK_TITLES.get(block, block))
         first = row
         for index, line in enumerate(block_lines, start=1):
-            _write_line(ws, row, index, line, flags)
+            _write_line(ws, row, index, line, flags, fx)
             row += 1
         last = row - 1
+        amounts[block] = sum(l.quantity * l.unit_price for l in block_lines)
         row = _write_subtotal(ws, row, SUBTOTAL_LABELS.get(block, "Разом:"),
-                              f"SUM(F{first}:F{last})")
+                              f"SUM(F{first}:F{last})", amounts[block], fx)
         subtotals[block] = row - 1
         _group(ws, first, last)
 
@@ -273,14 +431,23 @@ def _write_section(
     works_row = subtotals.get("works", 0)
 
     if plants_row and materials_row:
-        row = _write_subtotal(ws, row, "Разом матеріали та рослини:",
-                              f"F{plants_row}+F{materials_row}")
+        row = _write_subtotal(
+            ws, row, "Разом матеріали та рослини:",
+            f"F{plants_row}+F{materials_row}",
+            amounts.get("plants", 0.0) + amounts.get("materials", 0.0), fx,
+        )
         material_anchor = row - 1
+        material_amount = amounts.get("plants", 0.0) + amounts.get("materials", 0.0)
     else:
         material_anchor = materials_row or plants_row
+        material_amount = amounts.get("materials", 0.0) or amounts.get("plants", 0.0)
 
     parts = [f"F{r}" for r in (material_anchor, works_row) if r]
-    row = _write_subtotal(ws, row, f"Разом {title}:", "+".join(parts) or "0", strong=True)
+    section_amount = (material_amount if material_anchor else 0.0) + (
+        amounts.get("works", 0.0) if works_row else 0.0
+    )
+    row = _write_subtotal(ws, row, f"Разом {title}:", "+".join(parts) or "0",
+                          section_amount, fx, strong=True)
     return row, material_anchor, works_row
 
 
@@ -298,20 +465,21 @@ def _write_table_header(ws: Worksheet, row: int, block_label: str) -> int:
 
 
 def _write_line(ws: Worksheet, row: int, index: int, line: DraftLine,
-                flags: dict[str, str]) -> None:
+                flags: dict[str, str], fx: _Formulas) -> None:
     ws.cell(row, 1, index).alignment = Alignment(horizontal="center", vertical="center")
     name = ws.cell(row, 2, line.name)
     name.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    ws.cell(row, 3, line.quantity).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(row, 3, line.quantity).alignment = Alignment(horizontal="right", vertical="center")
     ws.cell(row, 4, line.unit).alignment = Alignment(horizontal="center", vertical="center")
-    ws.cell(row, 5, line.unit_price).alignment = Alignment(horizontal="center", vertical="center")
-    total = ws.cell(row, 6)
-    total.value = f"=C{row}*E{row}"  # live formula, as in the company's own workbook
+    ws.cell(row, 5, line.unit_price).alignment = Alignment(horizontal="right", vertical="center")
+
+    # Live formula, as in the company's own workbook, carrying the value it
+    # evaluates to so the cell is never blank outside Excel.
+    total = fx.write(ws, row, 6, f"C{row}*E{row}", line.quantity * line.unit_price)
     total.alignment = Alignment(horizontal="right", vertical="center")
 
     ws.cell(row, 3).number_format = QTY
-    ws.cell(row, 5).number_format = QTY
-    total.number_format = MONEY
+    ws.cell(row, 5).number_format = MONEY  # a price is money, not a count
 
     for col in range(1, LAST_COL + 1):
         cell = ws.cell(row, col)
@@ -343,19 +511,25 @@ def _comment(text: str):
     return c
 
 
-def _write_subtotal(ws: Worksheet, row: int, label: str, formula: str,
-                    strong: bool = False) -> int:
-    """Right-aligned bold-italic label with its value, as in the source proposal."""
+def _write_subtotal(ws: Worksheet, row: int, label: str, formula: str, value: float,
+                    fx: _Formulas, strong: bool = False) -> int:
+    """Right-aligned bold label with its value, as in the source proposal.
+
+    Every "Разом …" row is ruled off above and below so the eye stops there;
+    without a border these lines were indistinguishable from a data row.
+    """
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
     cell = ws.cell(row, 1, label)
-    cell.font = _f(12 if strong else 11, bold=True, italic=True)
+    cell.font = _f(12 if strong else 11, bold=True, italic=not strong)
     cell.alignment = Alignment(horizontal="right", vertical="center")
 
-    value = ws.cell(row, 6)
-    value.value = f"={formula}"
-    value.number_format = MONEY
-    value.font = _f(12 if strong else 11, bold=strong, italic=not strong)
-    value.alignment = Alignment(horizontal="right", vertical="center")
+    total = fx.write(ws, row, 6, formula, value, MONEY_STRONG if strong else MONEY)
+    total.font = _f(12 if strong else 11, bold=True, italic=not strong)
+    total.alignment = Alignment(horizontal="right", vertical="center")
+
+    rule = RULE_STRONG if strong else RULE
+    for col in range(1, LAST_COL + 1):
+        ws.cell(row, col).border = Border(top=rule, bottom=rule)
     ws.row_dimensions[row].height = 19
     return row + 1
 
@@ -369,7 +543,8 @@ def _group(ws: Worksheet, first: int, last: int) -> None:
 
 
 def _write_summary(
-    ws: Worksheet, row: int, anchors: list[tuple[str, int, int]], totals: EstimateTotals
+    ws: Worksheet, row: int, anchors: list[tuple[str, int, int]], totals: EstimateTotals,
+    fx: _Formulas,
 ) -> int:
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
     marker = ws.cell(row, 1, "Рахунок загальний:")
@@ -388,58 +563,82 @@ def _write_summary(
     ws.row_dimensions[row].height = 22
     row += 1
 
-    row, materials_total_row = _write_rollup(
+    row, materials_total_row, materials_amount = _write_rollup(
         ws, row, "Матеріали за видами послуг",
         [(f"Матеріали {t}", r) for t, r, _ in anchors if r],
-        "Разом за матеріали:",
+        "Разом за матеріали:", fx,
     )
-    row, works_total_row = _write_rollup(
+    row, works_total_row, works_amount = _write_rollup(
         ws, row, "Робота за видами послуг",
         [(f"Робота {t}", r) for t, _, r in anchors if r],
-        "Разом за роботу:",
+        "Разом за роботу:", fx,
     )
     row += 1
 
     if totals.surcharge:
         row = _write_subtotal(ws, row, "Безготівковий розрахунок (надбавка):",
-                              str(totals.surcharge))
+                              str(totals.surcharge), totals.surcharge, fx)
 
     grand = f"F{materials_total_row}+F{works_total_row}" + (
         f"+{totals.surcharge}" if totals.surcharge else ""
     )
+    grand_amount = materials_amount + works_amount + (totals.surcharge or 0.0)
     grand_row = row
-    row = _write_subtotal(ws, row, "Загальний рахунок", grand, strong=True)
-    row = _write_subtotal(ws, row, "Аванс (на матеріали)", f"F{materials_total_row}")
+    row = _write_subtotal(ws, row, "Загальний рахунок", grand, grand_amount, fx, strong=True)
+    row = _write_subtotal(ws, row, "Аванс (на матеріали)",
+                          f"F{materials_total_row}", materials_amount, fx)
     advance_works_row = row
+    # CEILING(x, 100) in Excel — round the works deposit up to a whole hundred.
+    advance_works = math.ceil(works_amount * 0.3 / 100) * 100 if works_amount else 0.0
     row = _write_subtotal(ws, row, "Аванс (на роботи)",
-                          f"CEILING(F{works_total_row}*0.3,100)")
+                          f"CEILING(F{works_total_row}*0.3,100)", advance_works, fx)
     row = _write_subtotal(ws, row, "Залишок",
-                          f"F{grand_row}-F{materials_total_row}-F{advance_works_row}")
+                          f"F{grand_row}-F{materials_total_row}-F{advance_works_row}",
+                          grand_amount - materials_amount - advance_works, fx)
     return row
 
 
 def _write_rollup(
-    ws: Worksheet, row: int, header: str, entries: list[tuple[str, int]], total_label: str
-) -> tuple[int, int]:
+    ws: Worksheet, row: int, header: str, entries: list[tuple[str, int]], total_label: str,
+    fx: _Formulas,
+) -> tuple[int, int, float]:
+    """One line per section, carrying that section's subtotal up to the invoice.
+
+    Every column of the table is filled: leaving К-сть, Од. вим. and Ціна blank
+    under a header that announces them read as missing data rather than as a
+    roll-up.
+    """
     row = _write_table_header(ws, row, header)
     first = row
     for index, (label, source_row) in enumerate(entries, start=1):
-        ws.cell(row, 1, index).alignment = Alignment(horizontal="center")
-        ws.cell(row, 2, label).alignment = Alignment(horizontal="left", vertical="center")
-        value = ws.cell(row, 6)
-        value.value = f"=F{source_row}"
-        value.number_format = MONEY
-        value.alignment = Alignment(horizontal="right")
+        amount = fx.at(ws, source_row)
+        ws.cell(row, 1, index).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row, 2, label).alignment = Alignment(
+            horizontal="left", vertical="center", wrap_text=True
+        )
+        qty = ws.cell(row, 3, 1)
+        qty.number_format = QTY
+        qty.alignment = Alignment(horizontal="right", vertical="center")
+        ws.cell(row, 4, "компл.").alignment = Alignment(horizontal="center", vertical="center")
+
+        price = fx.write(ws, row, 5, f"F{source_row}", amount)
+        price.alignment = Alignment(horizontal="right", vertical="center")
+        value = fx.write(ws, row, 6, f"C{row}*E{row}", amount)
+        value.alignment = Alignment(horizontal="right", vertical="center")
+
         for col in range(1, LAST_COL + 1):
-            ws.cell(row, col).border = BOX
-            if not ws.cell(row, col).font.bold:
-                ws.cell(row, col).font = _f(11)
+            cell = ws.cell(row, col)
+            cell.border = BOX
+            if not cell.font.bold:
+                cell.font = _f(11)
         row += 1
     last = row - 1
     total_row = row
+    amount = sum(fx.at(ws, r) for _, r in entries)
     row = _write_subtotal(ws, row, total_label,
-                          f"SUM(F{first}:F{last})" if entries else "0", strong=True)
-    return row, total_row
+                          f"SUM(F{first}:F{last})" if entries else "0",
+                          amount, fx, strong=True)
+    return row, total_row, amount
 
 
 def _write_footer(ws: Worksheet, row: int) -> None:
@@ -459,9 +658,46 @@ def _write_footer(ws: Worksheet, row: int) -> None:
     ws.cell(row, 5, "<<Замовник>>").font = _f(11, bold=True)
 
 
-def _finish_sheet(ws: Worksheet) -> None:
-    for col, width in enumerate(WIDTHS, start=1):
-        ws.column_dimensions[get_column_letter(col)].width = width
+def _autofit(ws: Worksheet, fx: _Formulas) -> None:
+    """Widen each column to its content, within the floor/ceiling above.
+
+    A money column narrower than its longest amount renders as ``###`` in Excel,
+    which is how a correct total still reads as a broken one. Formula cells hold
+    ``=SUM(...)``, not a number, so their width is measured from the value the
+    formula evaluates to.
+    """
+    merged = {
+        cell
+        for rng in ws.merged_cells.ranges
+        for cell in rng.cells
+    }
+
+    for col in range(1, LAST_COL + 1):
+        widest = len(HEADERS[col - 1])
+        for row in range(1, ws.max_row + 1):
+            # A merged label spans several columns; measuring it here would
+            # blow out the first one.
+            if (row, col) in merged:
+                continue
+            value = ws.cell(row, col).value
+            if value is None or value == "":
+                continue
+            if isinstance(value, str) and value.startswith("="):
+                number = fx.at(ws, row, col)
+                text = f"{number:,.2f}".replace(",", " ")
+            elif isinstance(value, (int, float)):
+                text = f"{value:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
+            else:
+                text = str(value)
+            widest = max(widest, len(text))
+        floor, ceiling = WIDTHS[col - 1], MAX_WIDTHS[col - 1]
+        ws.column_dimensions[get_column_letter(col)].width = min(
+            max(widest + 2, floor), ceiling
+        )
+
+
+def _finish_sheet(ws: Worksheet, fx: _Formulas) -> None:
+    _autofit(ws, fx)
 
     # No frozen panes and no repeating print titles on the proposal sheet.
     # Both pinned the 17-row letterhead: on screen it hung over the tables,
