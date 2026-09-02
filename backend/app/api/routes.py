@@ -922,9 +922,9 @@ def catalog_match(
 # --- export ------------------------------------------------------------------
 
 
-@router.get("/estimates/{estimate_id}/export")
-def export(estimate_id: int, session: Session = Depends(get_session)):
-    from ..services.export.xlsx import ExportMeta, export_estimate
+def _export_context(estimate_id: int, session: Session, suffix: str):
+    """Everything both exporters need, so the two cannot drift apart."""
+    from ..services.export.xlsx import ExportMeta
     from ..services.rules.totals import compute_totals
 
     estimate = _estimate(session, estimate_id)
@@ -938,19 +938,30 @@ def export(estimate_id: int, session: Session = Depends(get_session)):
     out_dir = settings.data_dir / "exports"
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
     safe = "".join(c for c in (project.name if project else "kp") if c.isalnum() or c in " -_")[:60]
-    target = out_dir / f"КП {safe.strip() or 'проєкт'} v{estimate.version} {stamp}.xlsx"
+    target = out_dir / f"КП {safe.strip() or 'проєкт'} v{estimate.version} {stamp}{suffix}"
 
+    meta = ExportMeta(
+        client_name=project.client_name if project else "",
+        address=project.address if project else "",
+        project_name=project.name if project else "",
+        manager=project.manager if project else "",
+        date=dt.date.today().strftime("%d.%m.%Y"),
+    )
+    return target, draft, totals, report, meta, layout
+
+
+@router.get("/estimates/{estimate_id}/export")
+def export(estimate_id: int, session: Session = Depends(get_session)):
+    from ..services.export.xlsx import export_estimate
+
+    target, draft, totals, report, meta, layout = _export_context(
+        estimate_id, session, ".xlsx"
+    )
     export_estimate(
         target,
         draft,
         totals,
-        meta=ExportMeta(
-            client_name=project.client_name if project else "",
-            address=project.address if project else "",
-            project_name=project.name if project else "",
-            manager=project.manager if project else "",
-            date=dt.date.today().strftime("%d.%m.%Y"),
-        ),
+        meta=meta,
         section_titles=layout.titles(),
         section_order=layout.order,
         report=report,
@@ -960,6 +971,24 @@ def export(estimate_id: int, session: Session = Depends(get_session)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=target.name,
     )
+
+
+@router.get("/estimates/{estimate_id}/export/pdf")
+def export_pdf(estimate_id: int, session: Session = Depends(get_session)):
+    from ..services.export.pdf import export_estimate_pdf
+
+    target, draft, totals, _report, meta, layout = _export_context(
+        estimate_id, session, ".pdf"
+    )
+    export_estimate_pdf(
+        target,
+        draft,
+        totals,
+        meta=meta,
+        section_titles=layout.titles(),
+        section_order=layout.order,
+    )
+    return FileResponse(target, media_type="application/pdf", filename=target.name)
 
 
 # --- jobs --------------------------------------------------------------------

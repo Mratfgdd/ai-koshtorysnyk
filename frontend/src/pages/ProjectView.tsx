@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { api, type DocumentInfo } from "../api";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { api, type AnalyzeResult, type DocumentInfo } from "../api";
 import { Card, Empty, Notice, Spinner, Stat, StatusTag, useAsync } from "../components";
 
 const KIND_LABEL: Record<string, string> = {
@@ -14,11 +14,14 @@ const KIND_LABEL: Record<string, string> = {
 export default function ProjectView() {
   const { projectId } = useParams();
   const id = Number(projectId);
+  const navigate = useNavigate();
   const { data, error, loading, reload } = useAsync(() => api.getProject(id), [id]);
 
   const [uploading, setUploading] = useState<string[]>([]);
   const [over, setOver] = useState(false);
-  const [analysing, setAnalysing] = useState(false);
+  const [analysing, setAnalysing] = useState<number | null>(null);
+  const [step, setStep] = useState("");
+  const [diagnosis, setDiagnosis] = useState<AnalyzeResult | null>(null);
   const [message, setMessage] = useState<{ tone: "info" | "warn" | "error" | "ok"; text: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -44,21 +47,42 @@ export default function ProjectView() {
     [id, reload],
   );
 
-  const analyse = async () => {
-    setAnalysing(true);
+  /**
+   * The one button the estimator needs: document analysis, then the object
+   * model, in that order.
+   *
+   * Both steps live behind a single POST — the per-page findings are what the
+   * object model is fused from, so splitting them into two clicks only ever
+   * produced a half-finished state. A successful reply means both are done,
+   * and the object analysis is where the estimator has to go next, so we take
+   * them there.
+   */
+  const analyse = async (doc: DocumentInfo) => {
+    setAnalysing(doc.id);
     setMessage(null);
+    setDiagnosis(null);
+    setStep("Крок 1 з 2: аналіз документа — вилучення тексту, класифікація та розбір сторінок");
     try {
       const result = await api.analyze(id);
-      if (result.status === "ok") {
-        setMessage({ tone: "ok", text: "Аналіз завершено. Перейдіть до «Аналіз об'єкта»." });
-      } else {
-        setMessage({ tone: "error", text: result.message ?? "Аналіз не вдався." });
-      }
+      setStep("Крок 2 з 2: аналіз об'єкта");
       reload();
+
+      if (result.status !== "ok") {
+        setDiagnosis(result);
+        return;
+      }
+      if (result.degraded) {
+        // Thin evidence: say so here rather than let a shaky analysis pass for
+        // a solid one on the next screen.
+        setDiagnosis(result);
+        return;
+      }
+      navigate(`/projects/${id}/analysis`);
     } catch (e) {
       setMessage({ tone: "error", text: (e as Error).message });
     } finally {
-      setAnalysing(false);
+      setAnalysing(null);
+      setStep("");
     }
   };
 
@@ -84,24 +108,69 @@ export default function ProjectView() {
           </div>
         </div>
         <div className="row">
-          <Link className="btn" to={`/projects/${id}/analysis`}>Аналіз об'єкта</Link>
           {data.latest_estimate_id && (
             <Link className="btn" to={`/projects/${id}/estimate/${data.latest_estimate_id}`}>Кошторис</Link>
           )}
-          <button className="primary" onClick={analyse} disabled={analysing || data.documents.length === 0}>
-            {analysing ? "Аналіз триває…" : "Аналізувати документи"}
-          </button>
         </div>
       </div>
 
       <div className="stack">
         {message && <Notice tone={message.tone}>{message.text}</Notice>}
 
-        {analysing && (
+        {diagnosis && (
+          <Notice
+            tone={diagnosis.degraded ? "warn" : "error"}
+            title={diagnosis.degraded ? "Аналіз виконано з обмеженнями" : "Аналіз не дав результату"}
+          >
+            <div>{diagnosis.reason ?? diagnosis.message}</div>
+
+            {diagnosis.recommendations && diagnosis.recommendations.length > 0 && (
+              <>
+                <div style={{ marginTop: 8, fontWeight: 600 }}>Що зробити:</div>
+                <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {diagnosis.recommendations.map((r, i) => (
+                    <li key={i} style={{ marginBottom: 3 }}>{r}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+
+            {diagnosis.stats && (
+              <div className="small muted" style={{ marginTop: 8 }}>
+                Прочитано: {diagnosis.stats.pages ?? 0} стор.
+                {" · "}із текстом: {diagnosis.stats.pages_with_text ?? 0}
+                {" · "}растрових: {diagnosis.stats.pages_raster_only ?? 0}
+                {" · "}символів тексту: {diagnosis.stats.text_chars ?? 0}
+              </div>
+            )}
+
+            {diagnosis.errors && diagnosis.errors.length > 0 && (
+              <details style={{ marginTop: 8 }}>
+                <summary className="small muted">Технічні деталі</summary>
+                <ul className="small muted" style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {diagnosis.errors.slice(0, 12).map((t, i) => <li key={i}>{t}</li>)}
+                </ul>
+              </details>
+            )}
+
+            <div className="row" style={{ marginTop: 10 }}>
+              <Link className="btn" to={`/projects/${id}/analysis`}>
+                Відкрити аналіз об'єкта
+              </Link>
+              <button onClick={() => setDiagnosis(null)}>Приховати</button>
+            </div>
+          </Notice>
+        )}
+
+        {analysing !== null && (
           <Card>
-            <Spinner label="Обробка документів: дешеве вилучення тексту, класифікація сторінок, потім аналіз лише сторінок із даними." />
+            <Spinner label={step} />
             <div className="progress" style={{ marginTop: 10 }}>
-              <div style={{ width: "60%" }} />
+              <div style={{ width: step.startsWith("Крок 2") ? "85%" : "45%" }} />
+            </div>
+            <div className="small muted" style={{ marginTop: 8 }}>
+              Аналізуються лише сторінки з даними. На великому комплекті це кілька хвилин —
+              сторінку можна не закривати.
             </div>
           </Card>
         )}
@@ -155,6 +224,7 @@ export default function ProjectView() {
                     <th className="num">Сторінок</th>
                     <th className="num">Розмір</th>
                     <th>Статус</th>
+                    <th>Аналіз</th>
                     <th />
                   </tr>
                 </thead>
@@ -166,15 +236,37 @@ export default function ProjectView() {
                       <td className="num">{d.page_count}</td>
                       <td className="num">{(d.size_bytes / 1e6).toFixed(1)} МБ</td>
                       <td>
-<StatusTag status={d.status} title={d.error ?? undefined} />
+                        <StatusTag status={d.status} title={d.error ?? undefined} />
+                      </td>
+                      <td>
+                        <button
+                          className="sm primary"
+                          onClick={() => analyse(d)}
+                          disabled={analysing !== null}
+                          title="Аналіз документа, а потім автоматично аналіз об'єкта"
+                        >
+                          {analysing === d.id ? "Аналіз…" : "Аналіз"}
+                        </button>
                       </td>
                       <td className="num">
-                        <button className="sm danger" onClick={() => removeDocument(d)}>Видалити</button>
+                        <button
+                          className="sm danger"
+                          onClick={() => removeDocument(d)}
+                          disabled={analysing !== null}
+                        >
+                          Видалити
+                        </button>
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {data.documents.length > 1 && (
+                <div className="small muted" style={{ marginTop: 8 }}>
+                  Аналіз охоплює всі документи проєкту — модель об'єкта будується з них разом,
+                  тому кнопка в будь-якому рядку дає той самий результат.
+                </div>
+              )}
             </div>
           )}
         </Card>

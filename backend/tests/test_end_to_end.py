@@ -427,3 +427,123 @@ def test_export_matches_the_reference_proposal_styling(built, tmp_path) -> None:
         if c.number_format and c.number_format != "General"
     }
     assert any("—" in f for f in formats), "zero values must render as «—»"
+
+
+# --- «Не враховувати в КП» ----------------------------------------------------
+
+
+def test_excluded_facts_are_kept_out_of_the_estimate(builder) -> None:
+    """A fact the estimator marks «Не враховувати в КП» must not drive anything.
+
+    The value stays on the analysis — the evidence that it was found is worth
+    keeping — but it must not reach the quantities the rules run on, exactly
+    like «Невідомо» and «Потрібне рішення» already did.
+    """
+    from app.models import ObjectAnalysis
+    from app.services.ai.schemas import FACT_STATUSES_OUT_OF_ESTIMATE
+    from app.services.pipeline import _from_analysis
+
+    assert "excluded" in FACT_STATUSES_OUT_OF_ESTIMATE
+
+    layout = builder.layout
+    session = builder.session
+
+    def inputs_for(status: str) -> dict:
+        analysis = ObjectAnalysis(
+            project_id=0,
+            version=1,
+            status="draft",
+            object_type="ділянка",
+            summary="",
+            facts=[
+                {
+                    "key": "lawn_area",
+                    "label": "Площа газону (рулонного)",
+                    "value": "259",
+                    "unit": "м2",
+                    "status": status,
+                    "section": "lawn",
+                }
+            ],
+            systems=[{"key": "lawn", "label": "Газон", "evidence": "", "confidence": "high"}],
+            components=[],
+            plants=[],
+        )
+        return _from_analysis(analysis, layout, session)
+
+    counted = inputs_for("confirmed")
+    assert counted["quantities"].get("lawn", {}), "a confirmed fact must reach the rules"
+
+    for status in ("excluded", "unknown", "needs_user_input"):
+        held_back = inputs_for(status)
+        assert not held_back["quantities"].get("lawn"), (
+            f"a fact with status «{status}» must not drive a quantity"
+        )
+
+
+# --- PDF ----------------------------------------------------------------------
+
+
+def test_pdf_export_carries_every_figure(built, tmp_path) -> None:
+    """The PDF must read as a finished proposal, not an empty shell.
+
+    A PDF has no formulas, so every number is baked in here; the check is that
+    the totals in the document equal the ones the engine computed.
+    """
+    import pymupdf
+
+    from app.services.export.pdf import export_estimate_pdf, money
+
+    out = export_estimate_pdf(
+        tmp_path / "kp.pdf",
+        built.draft,
+        built.totals,
+        meta=ExportMeta(client_name="Галина", address="с. Будьків", date="02.09.2026"),
+        section_titles={"pathway": "Доріжка", "planting": "Озеленення", "lawn": "Газон"},
+        section_order=SECTIONS,
+    )
+    assert out.exists() and out.stat().st_size > 10_000
+    # Story embeds whole font files; without subsetting this document is 1.3 MB,
+    # which is too heavy to email. Guard the subsetting step.
+    assert out.stat().st_size < 500_000, (
+        f"PDF is {out.stat().st_size:,} bytes — font subsetting is not running"
+    )
+
+    doc = pymupdf.open(out)
+    assert doc.page_count >= 1
+    text = "\n".join(page.get_text() for page in doc)
+
+    for probe in (
+        "Комерційна пропозиція",
+        "Замовник:",
+        "Галина",
+        "с. Будьків",
+        "Рахунок загальний:",
+        "Загальний рахунок",
+        "Разом за матеріали:",
+        "Аванс (на роботи)",
+    ):
+        assert probe in text, f"«{probe}» missing from the PDF"
+
+    # Cyrillic must render as glyphs, not as boxes or dropped characters.
+    assert "Кошторис" in text or "Комерційна" in text
+
+    # The headline figure has to match the engine, to the kopeck.
+    materials = sum(
+        l.quantity * l.unit_price
+        for l in built.draft.lines
+        if l.quantity > 0 and l.block in ("materials", "plants")
+    )
+    works = sum(
+        l.quantity * l.unit_price
+        for l in built.draft.lines
+        if l.quantity > 0 and l.block == "works"
+    )
+    grand = materials + works + (built.totals.surcharge or 0.0)
+    assert money(grand) in text, f"grand total {money(grand)} not printed in the PDF"
+
+    # Driver rows are internal inputs and must never reach the customer's copy.
+    assert "Площа газону (рулонного)" not in text
+
+    if (LOGO_PATH := __import__("app.services.export.xlsx", fromlist=["LOGO_PATH"]).LOGO_PATH).exists():
+        assert doc[0].get_images(), "logo not embedded in the PDF"

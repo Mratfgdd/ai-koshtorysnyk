@@ -54,16 +54,57 @@ export interface DocumentPage {
   findings: Record<string, unknown>;
 }
 
+/**
+ * `excluded` is set by the estimator, never by the model: it keeps the finding
+ * on record while taking its value out of the estimate.
+ */
+export type FactStatus =
+  | "confirmed"
+  | "assumption"
+  | "unknown"
+  | "needs_user_input"
+  | "excluded";
+
 export interface Fact {
   key: string;
   label: string;
   value: string;
   unit: string;
-  status: "confirmed" | "assumption" | "unknown" | "needs_user_input";
+  status: FactStatus;
   confidence: Confidence;
   source_type: string;
   source_ref: string;
   note: string;
+}
+
+export interface SystemRow {
+  key: string;
+  label: string;
+  evidence: string;
+  confidence: Confidence;
+}
+
+export interface ComponentRow {
+  name: string;
+  quantity: number | null;
+  unit: string;
+  note: string;
+}
+
+/** What the backend says when an analysis produced nothing usable. */
+export interface AnalyzeResult {
+  status: string;
+  analysis_id?: number;
+  message?: string;
+  /** Plain-language cause, already in Ukrainian. */
+  reason?: string;
+  /** What the estimator should do about it. */
+  recommendations?: string[];
+  /** The object model came from the lenient fallback pass. */
+  degraded?: boolean;
+  stats?: Record<string, number>;
+  errors?: string[];
+  skipped?: unknown[];
 }
 
 export interface PlantRow {
@@ -85,8 +126,8 @@ export interface Analysis {
   object_type: string;
   summary: string;
   facts: Fact[];
-  systems: { key: string; label: string; evidence: string; confidence: Confidence }[];
-  components: { name: string; quantity: number | null; unit: string; note: string }[];
+  systems: SystemRow[];
+  components: ComponentRow[];
   plants: PlantRow[];
   assumptions: string[];
   unknowns: string[];
@@ -304,10 +345,7 @@ export const api = {
   deleteDocument: (id: number) => request<void>(`/documents/${id}`, { method: "DELETE" }),
 
   analyze: (projectId: number) =>
-    request<{ status: string; analysis_id?: number; message?: string; errors?: string[]; skipped?: unknown[] }>(
-      `/projects/${projectId}/analyze`,
-      { method: "POST" },
-    ),
+    request<AnalyzeResult>(`/projects/${projectId}/analyze`, { method: "POST" }),
   getAnalysis: (projectId: number) => request<Analysis>(`/projects/${projectId}/analysis`),
   updateAnalysis: (id: number, body: Partial<Analysis>) =>
     request<Analysis>(`/analysis/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
@@ -356,6 +394,7 @@ export const api = {
   approve: (estimateId: number) =>
     request<{ status: string; report: Validation }>(`/estimates/${estimateId}/approve`, { method: "POST" }),
   exportUrl: (estimateId: number) => url(`/estimates/${estimateId}/export`),
+  exportPdfUrl: (estimateId: number) => url(`/estimates/${estimateId}/export/pdf`),
 
   listQuestions: (
     projectId: number,

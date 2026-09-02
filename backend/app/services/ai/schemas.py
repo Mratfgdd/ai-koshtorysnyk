@@ -283,7 +283,18 @@ class ObjectAnalysisResult(BaseModel):
 
 SECTION_KEYS: frozenset[str] = frozenset(SectionKey.__args__)  # type: ignore[attr-defined]
 CONFIDENCES = frozenset({"high", "medium", "low"})
-FACT_STATUSES = frozenset({"confirmed", "assumption", "unknown", "needs_user_input"})
+# "excluded" is set by the estimator in the UI, never by the model: it drops a
+# value out of the estimate while keeping the evidence that it was found, which
+# deleting the row would throw away.
+FACT_EXCLUDED = "excluded"
+FACT_STATUSES = frozenset(
+    {"confirmed", "assumption", "unknown", "needs_user_input", FACT_EXCLUDED}
+)
+
+# Statuses whose value must not reach the estimate. "unknown" and
+# "needs_user_input" have no trustworthy number yet; "excluded" has one the
+# estimator has decided not to bill.
+FACT_STATUSES_OUT_OF_ESTIMATE = frozenset({"unknown", "needs_user_input", FACT_EXCLUDED})
 QUESTION_KINDS = frozenset({"text", "number", "choice", "boolean"})
 SOURCE_TYPES = frozenset({
     "historical_estimate", "uploaded_pdf", "floor_plan", "product_catalog",

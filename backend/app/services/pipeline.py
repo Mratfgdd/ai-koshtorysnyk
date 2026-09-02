@@ -27,6 +27,7 @@ from ..models import (
 from ..schemas import EstimateCreate
 from .ai.analyzer import DocumentAnalyzer
 from .ai.schemas import (
+    FACT_STATUSES_OUT_OF_ESTIMATE,
     clean_confidence,
     clean_fact_status,
     clean_question_kind,
@@ -78,6 +79,109 @@ def _finish(session: Session, job: JobRun, status: str, detail: dict[str, Any], 
     session.commit()
 
 
+# --- diagnosing an empty analysis --------------------------------------------
+
+# A drawing sheet that carries quantities has a schedule on it, and a schedule
+# is text. Below this, the file is a picture, not a document to cost.
+_THIN_TEXT_CHARS = 400
+
+
+def _diagnose_empty_analysis(
+    documents: list[tuple[Any, str]], outcome: Any
+) -> dict[str, Any]:
+    """Say why nothing came out, and what the estimator should do about it.
+
+    "Не вдалося сформувати аналіз об'єкта" is true but useless: it does not
+    distinguish a missing API key from a one-page concept sketch from a scan
+    with no text layer, and each needs a different action. The counts below
+    come from the extraction that already ran, so this costs nothing.
+    """
+    pages = [page for doc, _ in documents for page in doc.pages]
+    total_pages = len(pages)
+    text_chars = sum(p.text_length for p in pages)
+    with_text = sum(1 for p in pages if p.text_length > 40)
+    raster_only = sum(1 for p in pages if p.text_length <= 40 and p.image_count > 0)
+    analysed = len(getattr(outcome, "pages", []))
+    names = ", ".join(f"«{name}»" for _, name in documents)
+
+    stats = {
+        "documents": len(documents),
+        "pages": total_pages,
+        "pages_with_text": with_text,
+        "pages_raster_only": raster_only,
+        "text_chars": text_chars,
+        "pages_analysed": analysed,
+    }
+
+    if any("ANTHROPIC_API_KEY" in e for e in outcome.errors):
+        return {
+            "reason": "Аналіз недоступний: не налаштовано ключ ANTHROPIC_API_KEY.",
+            "recommendations": [
+                "Додайте ключ у файл .env на сервері та перезапустіть сервіс.",
+                "Без ключа показники об'єкта можна заповнити вручну — "
+                "кошторис, правила шаблону й експорт працюють і без AI.",
+            ],
+            "stats": stats,
+        }
+
+    if total_pages == 0:
+        return {
+            "reason": f"У файлі {names} немає сторінок, які вдалося прочитати.",
+            "recommendations": [
+                "Перевірте, чи PDF не пошкоджений і чи відкривається у переглядачі.",
+                "Якщо файл захищений паролем — зніміть захист і завантажте знову.",
+            ],
+            "stats": stats,
+        }
+
+    if total_pages <= 2 and text_chars < _THIN_TEXT_CHARS:
+        return {
+            "reason": (
+                f"Недостатньо вихідних даних у файлі для виділення об'ємів чи систем: "
+                f"{total_pages} стор., лише {text_chars} символів тексту."
+            ),
+            "recommendations": [
+                "Додайте аркуші з відомостями: асортиментна відомість рослин, "
+                "відомість елементів покриття, специфікація обладнання.",
+                "Потрібен генплан або план розпланування з розмірами та площами — "
+                "з самої візуалізації об'єми зняти неможливо.",
+                "Якщо є ТЗ від замовника, впишіть його у поле «Технічне завдання» "
+                "проєкту: воно бере участь в аналізі нарівні з кресленнями.",
+            ],
+            "stats": stats,
+        }
+
+    if with_text == 0 and raster_only:
+        return {
+            "reason": (
+                f"У файлі {names} немає текстового шару: усі {raster_only} стор. — "
+                "растрові зображення (скан або експорт у картинку)."
+            ),
+            "recommendations": [
+                "Експортуйте PDF з CAD або графічного редактора напряму, "
+                "а не скануйте роздруківку — тоді підписи й відомості читаються як текст.",
+                "Якщо є лише скан, прожене його через OCR перед завантаженням.",
+                "Переконайтеся, що аркуші з відомостями увійшли в експорт.",
+            ],
+            "stats": stats,
+        }
+
+    return {
+        "reason": (
+            f"З {total_pages} стор. не вдалося виділити ані об'ємів, ані систем, "
+            "придатних для кошторису."
+        ),
+        "recommendations": [
+            "Перевірте, чи комплект містить відомості з кількостями, а не лише "
+            "плани й візуалізації.",
+            "Впишіть у «Технічне завдання» проєкту склад робіт — це дає аналізу опору.",
+            "Показники об'єкта можна заповнити вручну на сторінці «Аналіз об'єкта», "
+            "після чого кошторис порахується за правилами шаблону.",
+        ],
+        "stats": stats,
+    }
+
+
 # --- step 1: analyse documents ----------------------------------------------
 
 
@@ -111,18 +215,25 @@ def analyse_project(session: Session, project: Project) -> dict[str, Any]:
     _store_page_findings(session, project, outcome)
 
     if outcome.analysis is None:
+        diagnosis = _diagnose_empty_analysis(documents, outcome)
         _finish(
             session,
             job,
             "error",
-            {"errors": outcome.errors, "skipped": outcome.skipped, "usage": outcome.usage},
+            {
+                "errors": outcome.errors,
+                "skipped": outcome.skipped,
+                "usage": outcome.usage,
+                **diagnosis,
+            },
             "; ".join(outcome.errors) or "Аналіз не сформовано.",
         )
         return {
             "status": "error",
-            "message": "Не вдалося сформувати аналіз об'єкта.",
+            "message": diagnosis["reason"],
             "errors": outcome.errors,
             "skipped": outcome.skipped,
+            **diagnosis,
         }
 
     analysis = _store_analysis(session, project, outcome)
@@ -143,7 +254,7 @@ def analyse_project(session: Session, project: Project) -> dict[str, Any]:
     project.status = "analysed"
     session.commit()
 
-    return {
+    result = {
         "status": "ok",
         "analysis_id": analysis.id,
         "job_id": job.id,
@@ -151,7 +262,23 @@ def analyse_project(session: Session, project: Project) -> dict[str, Any]:
         "skipped": outcome.skipped,
         "errors": outcome.errors,
         "usage": outcome.usage,
+        "degraded": outcome.degraded,
     }
+    if outcome.degraded:
+        # The lenient pass produced something, but it rests on thin evidence.
+        # Say so plainly rather than let it pass for a full analysis.
+        result["reason"] = (
+            "Даних у файлі мало — аналіз виконано в полегшеному режимі, "
+            "більшість показників позначено як припущення."
+        )
+        result["recommendations"] = [
+            "Перевірте кожен показник у розділі «Показники об'єкта» — "
+            "припущення позначені окремим статусом.",
+            "Показники, які не мають входити до КП, позначте статусом "
+            "«Не враховувати в КП».",
+            "Для точного розрахунку додайте аркуші з відомостями кількостей.",
+        ]
+    return result
 
 
 def _sync_pages(session: Session, document: Document, extracted: Any) -> None:
@@ -453,7 +580,7 @@ def _from_analysis(
     }
 
     for fact in analysis.facts or []:
-        if fact.get("status") in ("unknown", "needs_user_input"):
+        if fact.get("status") in FACT_STATUSES_OUT_OF_ESTIMATE:
             continue
         value = _as_float(fact.get("value"))
         if value is None:
