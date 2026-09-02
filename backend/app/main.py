@@ -29,8 +29,21 @@ log = logging.getLogger("estimator")
 
 settings = get_settings()
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
+_booted = False
+
+
+def bootstrap() -> None:
+    """Create the schema, load the seed and report what is available.
+
+    Kept separate from the lifespan handler because not every host runs one:
+    a WSGI container (cPanel's Passenger, via ``passenger_wsgi.py``) has no
+    lifespan concept at all, so the tables would never be created and every
+    request would fail with "no such table: catalog_items". Idempotent, so
+    calling it from both paths is safe.
+    """
+    global _booted
+    if _booted:
+        return
     init_db()
     log.info("database ready at %s", settings.sqlalchemy_url)
     try:
@@ -48,6 +61,12 @@ async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
         log.warning(
             "template not compiled -- run: python scripts/compile_template.py <Шаблон для ШІ.xlsx>"
         )
+    _booted = True
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
+    bootstrap()
     yield
 
 
@@ -55,6 +74,7 @@ app = FastAPI(
     title=settings.app_name,
     version="1.0.0",
     lifespan=lifespan,
+    root_path=settings.root_path,
     description=(
         "AI-кошторисник для ландшафтних проєктів: аналіз креслень, "
         "правила з шаблону замовника, каталог, перевірка та експорт у XLSX."
@@ -71,7 +91,9 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],  # so the browser sees the export filename
 )
 
-app.include_router(router, prefix="/api")
+# Prefix is configurable because cPanel mounts the app at a URL path of your
+# choosing; mounting at /api while also prefixing here yields /api/api/...
+app.include_router(router, prefix=settings.api_prefix)
 
 
 @app.exception_handler(Exception)
@@ -96,6 +118,11 @@ if _DIST.is_dir():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def _spa(full_path: str):  # type: ignore[no-untyped-def]
+        # Never let the SPA fallback answer an API path: a typo in a route
+        # would silently return index.html with a 200 instead of a 404.
+        prefix = settings.api_prefix.strip("/")
+        if prefix and full_path.startswith(prefix):
+            return JSONResponse(status_code=404, content={"message": "Not found"})
         candidate = _DIST / full_path
         if full_path and candidate.is_file():
             return FileResponse(candidate)

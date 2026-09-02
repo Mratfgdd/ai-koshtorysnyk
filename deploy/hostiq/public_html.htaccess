@@ -1,0 +1,54 @@
+# Frontend .htaccess — copy to public_html/.htaccess
+#
+# Two jobs: serve the React SPA so deep links survive a refresh, and let the
+# browser cache the fingerprinted assets while never caching index.html.
+
+# --- SPA routing -------------------------------------------------------------
+# Vite emits one index.html plus hashed assets. Without this, /projects/7
+# returns 404 on reload because Apache looks for a file at that path.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  # Never rewrite the API — it is proxied or lives on another host.
+  RewriteRule ^api/ - [L]
+
+  # Real files and directories win.
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # Everything else is a client-side route.
+  RewriteRule ^ index.html [L]
+</IfModule>
+
+# --- caching -----------------------------------------------------------------
+<IfModule mod_headers.c>
+  # Hashed filenames change on every build, so they can be cached hard.
+  <FilesMatch "\.(js|css|woff2?|svg|png|jpg|jpeg|webp|ico)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </FilesMatch>
+
+  # index.html must never be cached, or users keep an old bundle after a deploy.
+  <FilesMatch "^index\.html$">
+    Header set Cache-Control "no-cache, no-store, must-revalidate"
+  </FilesMatch>
+</IfModule>
+
+# --- compression -------------------------------------------------------------
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/plain text/css text/javascript
+  AddOutputFilterByType DEFLATE application/javascript application/json
+  AddOutputFilterByType DEFLATE image/svg+xml
+</IfModule>
+
+<IfModule mod_mime.c>
+  AddType application/javascript .js
+  AddType text/css .css
+  AddType image/svg+xml .svg
+  AddType font/woff2 .woff2
+</IfModule>
+
+# --- misc --------------------------------------------------------------------
+Options -Indexes
+ErrorDocument 404 /index.html

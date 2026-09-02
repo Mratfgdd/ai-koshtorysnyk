@@ -7,6 +7,7 @@ a browser that cannot reach it. These pin the parts Render and Vercel rely on.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -172,6 +173,37 @@ def test_storage_paths_follow_data_dir(tmp_path: Path) -> None:
     other = Settings(data_dir=tmp_path, upload_dir=tmp_path / "custom")
     assert other.upload_dir == tmp_path / "custom"
     assert other.cache_dir == tmp_path / "cache"
+
+
+def test_api_prefix_is_configurable_for_a_path_mounted_app() -> None:
+    """cPanel mounts a Python app at a URL path you choose.
+
+    Mounting it at /api while the router also prefixes /api yields
+    /api/api/health — a 404 that looks like a broken deployment. The prefix is
+    therefore a setting, checked here in a subprocess because the app module
+    reads it once at import.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "from app.main import app;"
+        "print(sorted(r.path for r in app.routes "
+        "if getattr(r,'path','').endswith('/health')))"
+    )
+    for prefix, expected in (("", "/health"), ("/api", "/api/health")):
+        env = {**os.environ, "API_PREFIX": prefix}
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT / "backend",
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert expected in result.stdout, (
+            f"API_PREFIX={prefix!r} produced {result.stdout.strip()}"
+        )
 
 
 def test_no_content_routes_declare_no_body() -> None:

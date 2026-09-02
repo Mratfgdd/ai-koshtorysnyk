@@ -1,0 +1,33 @@
+# Backend .htaccess — copy to the Python app's document root
+# (cPanel writes its own Passenger block here; keep that and add the rest).
+#
+# The upload limits are the point of this file. A 100 MB+ drawing set is
+# rejected by the web server long before FastAPI sees it unless every layer
+# below is raised, and each layer fails with a different, unhelpful error.
+
+# --- upload limits -----------------------------------------------------------
+# LiteSpeed (what HostIQ runs) reads this; Apache ignores it harmlessly.
+<IfModule LiteSpeed>
+  # 200 MB, in bytes. Keep above MAX_UPLOAD_MB so the app returns a clean 413
+  # instead of the server cutting the connection.
+  LimitRequestBody 209715200
+</IfModule>
+
+<IfModule mod_php.c>
+  php_value upload_max_filesize 200M
+  php_value post_max_size 200M
+</IfModule>
+
+# suPHP / PHP-FPM hosts read a user.ini instead — see docs/HOSTIQ.md.
+
+# --- timeouts ----------------------------------------------------------------
+# A 60-page drawing set takes minutes to analyse. The default 300 s proxy
+# timeout cuts the request midway and the browser shows a bare 504.
+<IfModule mod_reqtimeout.c>
+  RequestReadTimeout body=0,MinRate=500
+</IfModule>
+
+# --- CORS is handled by FastAPI ----------------------------------------------
+# Do not add Header set Access-Control-Allow-Origin here: two layers both
+# setting it produces a duplicated header and the browser rejects every
+# response.

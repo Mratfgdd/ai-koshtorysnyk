@@ -73,6 +73,43 @@ def test_uploading_a_non_pdf_is_rejected(client: TestClient) -> None:
     client.delete(f"/api/projects/{project_id}")
 
 
+def test_oversized_upload_is_refused_before_it_is_written(client: TestClient) -> None:
+    """Drawing sets run to 150 MB+; the limit must bite before touching disk.
+
+    Writing the whole body and checking afterwards can exhaust a shared host's
+    quota, so an oversized upload is rejected on its declared Content-Length.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    project_id = client.post("/api/projects", json={"name": "Ліміт"}).json()["id"]
+    oversized = (settings.max_upload_mb * 1024 * 1024) + (10 * 1024 * 1024)
+
+    response = client.post(
+        f"/api/projects/{project_id}/documents",
+        files={"file": ("huge.pdf", io.BytesIO(b"%PDF-1.4\n"), "application/pdf")},
+        headers={"Content-Length": str(oversized)},
+    )
+    assert response.status_code == 413
+    assert str(settings.max_upload_mb) in response.json()["detail"]
+
+    upload_dir = settings.upload_dir / str(project_id)
+    written = list(upload_dir.glob("*")) if upload_dir.exists() else []
+    assert not written, f"rejected upload still hit disk: {written}"
+
+    client.delete(f"/api/projects/{project_id}")
+
+
+def test_empty_upload_is_refused(client: TestClient) -> None:
+    project_id = client.post("/api/projects", json={"name": "Порожній файл"}).json()["id"]
+    response = client.post(
+        f"/api/projects/{project_id}/documents",
+        files={"file": ("empty.pdf", io.BytesIO(b""), "application/pdf")},
+    )
+    assert response.status_code == 400
+    client.delete(f"/api/projects/{project_id}")
+
+
 def test_analyze_without_documents_is_refused(client: TestClient) -> None:
     project_id = client.post("/api/projects", json={"name": "Порожній"}).json()["id"]
     response = client.post(f"/api/projects/{project_id}/analyze")

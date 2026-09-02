@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +18,7 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
 )
@@ -63,6 +63,8 @@ from ..services.estimate.store import (
 from ..services.pipeline import analyse_project, plan_and_build, recalculate_estimate
 from ..services.rules.engine import normalize_name
 from ..services.validation.validators import validate
+
+_MULTIPART_OVERHEAD = 8 * 1024  # boundary + headers slack
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -278,6 +280,7 @@ def _document_dict(d: Document) -> dict[str, Any]:
 @router.post("/projects/{project_id}/documents", status_code=201)
 async def upload_document(
     project_id: int,
+    request: Request,
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
 ):
@@ -285,17 +288,45 @@ async def upload_document(
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(415, "Підтримуються лише PDF-файли.")
 
+    limit = settings.max_upload_mb * 1024 * 1024
+
+    # Reject on the declared size before reading a byte. Drawing sets run to
+    # 150 MB+, and on shared hosting writing an oversized file to disk only to
+    # delete it can exhaust the account's quota.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit + _MULTIPART_OVERHEAD:
+        raise HTTPException(
+            413,
+            f"Файл більший за {settings.max_upload_mb} МБ "
+            f"({int(declared) / 1024 / 1024:.0f} МБ).",
+        )
+
     target_dir = settings.upload_dir / str(project.id)
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / Path(file.filename).name
 
-    with target.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
-
-    size = target.stat().st_size
-    if size > settings.max_upload_mb * 1024 * 1024:
+    # Stream in chunks and stop the moment the limit is passed, rather than
+    # copying the whole body first and checking afterwards.
+    size = 0
+    try:
+        with target.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(
+                        413, f"Файл більший за {settings.max_upload_mb} МБ."
+                    )
+                out.write(chunk)
+    except HTTPException:
         target.unlink(missing_ok=True)
-        raise HTTPException(413, f"Файл більший за {settings.max_upload_mb} МБ.")
+        raise
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+    if size == 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, "Файл порожній.")
 
     document = Document(
         project_id=project.id,

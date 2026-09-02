@@ -35,6 +35,17 @@ class Settings(BaseSettings):
     cors_origins: str = ""
     cors_allow_vercel: bool = True
 
+    # Where the API sits under the host.
+    #
+    # cPanel's "Setup Python App" mounts the app at a URL path you choose. If
+    # you mount it at /api, the routes must NOT add /api again or every path
+    # becomes /api/api/... . Set API_PREFIX="" in that case. On a dedicated
+    # subdomain (api.example.com) leave it as /api.
+    api_prefix: str = "/api"
+    # Set when a proxy strips a prefix before forwarding, so generated links
+    # and the OpenAPI docs point at the public URL.
+    root_path: str = ""
+
     @property
     def cors_origin_list(self) -> list[str]:
         origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
