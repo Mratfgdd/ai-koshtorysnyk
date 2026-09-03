@@ -38,9 +38,72 @@ Nginx не міг би зайняти цей порт, тому Apache пере�
 було (`/home` порожній, жодного vhost), тому перенесення нічого не зламало —
 панель Webuzo слухає окремі порти 2002–2005 і працює як раніше.
 
-Файл `webuzoVH.conf` позначений як згенерований Webuzo. Якщо панель колись
-перезапише його назад на `:80`, Apache просто не матиме відповідного `Listen` і
-цей vhost стане неактивним — Nginx на `:80` це не зачепить.
+### Це не тримається саме по собі
+
+Припущення, що правки конфігу достатньо, виявилось хибним. У ніч на 03.09
+сайт віддавав дефолтну заглушку Webuzo. Журнал показує рівно, що сталося:
+
+```
+Sep 03 00:00:03  httpd.conf, webuzo.conf, webuzoVH.conf перезаписані  (Listen 80 повернувся)
+Sep 03 00:00:06  nginx.service: Main process exited, code=killed, status=9/KILL
+Sep 03 00:00:06  /usr/local/apps/apache2/bin/httpd -k restart
+```
+
+Два окремі механізми, і кожен вимагає свого захисту:
+
+1. **Webuzo перегенеровує конфігурацію Apache цілком** — не редагує, а
+   переписує всі три файли. Будь-яка правка `Listen` живе до наступного
+   нічного запуску. Шаблон, з якого це генерується, у дереві Webuzo у
+   відкритому вигляді не лежить, тож «полагодити джерело» неможливо.
+2. **Процедура перезапуску Webuzo вбиває процеси за іменем** — `nginx`
+   потрапляє під роздачу разом із панельним. Системний Nginx отримав
+   `SIGKILL`, а юніт не мав `Restart=`, тому просто лишився мертвим.
+
+### Захист
+
+`deploy/vps/nginx-restart.conf` → `/etc/systemd/system/nginx.service.d/restart.conf`
+
+`Restart=always`, `RestartSec=2`. Nginx більше не може лишитись убитим.
+Самого цього замало: якщо Apache уже зайняв `:80`, перезапуск падає з
+`code=exited status=1`.
+
+`deploy/vps/port80-guard.{sh,service,timer}` → `/usr/local/sbin/` і
+`/etc/systemd/system/`
+
+Раз на хвилину (стільки ж, скільки й моніторинг Webuzo) перевіряє, хто тримає
+`:80`. Якщо це Apache — зупиняє його; якщо Nginx не слухає — піднімає.
+Навмисно вузький: Apache на `:8080` не чіпає.
+
+Перевірено відтворенням аварії — `Listen 80` повернуто, `pkill -9 -x nginx`,
+`httpd start`:
+
+```
+11:17:01  nginx убито; автоперезапуск провалився (Apache тримає :80)
+11:17:02  port80-guard: Apache has taken :80 back — stopping it
+11:17:04  nginx піднявся і зайняв :80
+```
+
+Відновлення — близько трьох секунд, без втручання. Найгірший випадок —
+до хвилини, поки не спрацює таймер.
+
+### Стан після перезавантаження
+
+Автозапуск Apache вимкнено (`chkconfig httpd off`, усі рівні `off`), але Webuzo
+однаково піднімає його своїм `webuzo-onboot`, повз systemd. Це не проблема:
+конфіг переживає перезавантаження, тому Apache стартує **на `:8080`**, а Nginx
+спокійно бере `:80`. Перевірено ребутом: `:80` — nginx, `:8080` і `:443` —
+httpd, `:2005` — панель.
+
+### Якщо захочете прибрати цю конструкцію
+
+Правильне рішення без вартового — задати порт Apache у самій панелі Webuzo
+(Apache Settings), щоб регенерація одразу писала `8080`, або зовсім прибрати
+Apache з Webuzo, якщо сайти на ньому не плануються. Тоді
+`port80-guard.timer` можна вимкнути:
+
+```bash
+systemctl disable --now port80-guard.timer
+```
 
 ---
 
@@ -152,6 +215,10 @@ tail -f /var/log/nginx/estimator.error.log
 | `nginx.conf` | `/etc/nginx/nginx.conf` |
 | `estimator.conf` | `/etc/nginx/conf.d/estimator.conf` |
 | `estimator.service` | `/etc/systemd/system/estimator.service` |
+| `nginx-restart.conf` | `/etc/systemd/system/nginx.service.d/restart.conf` |
+| `port80-guard.sh` | `/usr/local/sbin/port80-guard.sh` |
+| `port80-guard.service` | `/etc/systemd/system/port80-guard.service` |
+| `port80-guard.timer` | `/etc/systemd/system/port80-guard.timer` |
 | `redeploy.sh` | запускається локально |
 
 Стоковий `nginx.conf` збережено на сервері як `/etc/nginx/nginx.conf.stock-bak`.
