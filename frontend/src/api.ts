@@ -10,6 +10,37 @@ export interface Health {
   quantity_rules: number;
   ai_available: boolean;
   ai_model: string;
+  /** False when OPENAI_API_KEY is unset — the microphone is hidden then. */
+  voice_available?: boolean;
+  voice_model?: string;
+}
+
+/** One conflict from the object analysis, with its resolution if it has one. */
+export interface Conflict {
+  topic: string;
+  values: string[];
+  impact: string;
+  question: string;
+  resolved?: boolean;
+  resolution?: string;
+  resolution_understood?: string;
+  resolved_at?: string;
+}
+
+export interface ResolveResult {
+  status: string;
+  issue_id: number;
+  resolved: boolean;
+  /** One sentence: how the model read the clarification. */
+  understood: string;
+  /** Human-readable list of what changed on the analysis. */
+  changes: string[];
+  unresolved: string;
+  recalculated: boolean;
+  estimate_id: number | null;
+  analysis_id: number;
+  validation?: Validation;
+  message?: string;
 }
 
 export interface Project {
@@ -132,7 +163,7 @@ export interface Analysis {
   assumptions: string[];
   unknowns: string[];
   risks: string[];
-  conflicts: { topic: string; values: string[]; impact: string; question: string }[];
+  conflicts: Conflict[];
   updated_at: string | null;
 }
 
@@ -347,6 +378,20 @@ export const api = {
   analyze: (projectId: number) =>
     request<AnalyzeResult>(`/projects/${projectId}/analyze`, { method: "POST" }),
   getAnalysis: (projectId: number) => request<Analysis>(`/projects/${projectId}/analysis`),
+
+  transcribe: (audio: Blob, filename = "clarification.webm") => {
+    const form = new FormData();
+    form.append("file", audio, filename);
+    return request<{ text: string; chars: number }>("/audio/transcribe", {
+      method: "POST",
+      body: form,
+    });
+  },
+  resolveIssue: (projectId: number, issueId: number, comment: string) =>
+    request<ResolveResult>(`/projects/${projectId}/issues/${issueId}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ comment }),
+    }),
   updateAnalysis: (id: number, body: Partial<Analysis>) =>
     request<Analysis>(`/analysis/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
 

@@ -1,12 +1,15 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { Link } from "react-router-dom";
 import {
   api,
   num,
   type Analysis,
   type ComponentRow,
+  type Conflict,
   type Fact,
   type FactStatus,
+  type ResolveResult,
   type SystemRow,
 } from "../api";
 import { Card, ConfidenceBadge, Empty, Notice, Spinner, useAsync } from "../components";
@@ -32,6 +35,15 @@ export default function AnalysisView() {
   const [dirty, setDirty] = useState(false);
   const [building, setBuilding] = useState(false);
   const [message, setMessage] = useState<{ tone: "info" | "warn" | "error" | "ok"; text: string } | null>(null);
+  const [lastEstimate, setLastEstimate] = useState<number | null>(null);
+
+  // The microphone is only offered when the backend has a key for Whisper.
+  const [voiceAvailable, setVoiceAvailable] = useState(false);
+  useEffect(() => {
+    api.health()
+      .then((h) => setVoiceAvailable(Boolean(h.voice_available)))
+      .catch(() => setVoiceAvailable(false));
+  }, []);
 
   const plants = useMemo(() => data?.plants ?? [], [data]);
   const included = plants.filter((p) => !p.is_existing);
@@ -156,22 +168,55 @@ export default function AnalysisView() {
       </div>
 
       <div className="stack">
-        {message && <Notice tone={message.tone}>{message.text}</Notice>}
+        {message && (
+          <Notice tone={message.tone}>
+            {message.text}
+            {lastEstimate !== null && (
+              <div style={{ marginTop: 8 }}>
+                <Link className="btn" to={`/projects/${id}/estimate/${lastEstimate}`}>
+                  Відкрити оновлений кошторис
+                </Link>
+              </div>
+            )}
+          </Notice>
+        )}
 
         {data.summary && <Card title="Стисло">{data.summary}</Card>}
 
         {data.conflicts.length > 0 && (
-          <Card title="Суперечливі дані">
+          <Card
+            title="Суперечливі дані"
+            action={
+              <span className="small muted">
+                Вирішено: {data.conflicts.filter((c) => c.resolved).length} з {data.conflicts.length}
+              </span>
+            }
+          >
             <div className="stack">
               {data.conflicts.map((c, i) => (
-                <Notice key={i} tone="warn" title={c.topic}>
-                  <div>Варіанти: {c.values.join(" / ")}</div>
-                  {c.impact && <div className="small muted">Вплив: {c.impact}</div>}
-                  {c.question && <div style={{ marginTop: 6 }}><strong>{c.question}</strong></div>}
-                </Notice>
+                <ConflictCard
+                  key={`${c.topic}-${i}`}
+                  conflict={c}
+                  index={i}
+                  projectId={id}
+                  voiceAvailable={voiceAvailable}
+                  onResolved={(result) => {
+                    reload();
+                    setMessage({
+                      tone: result.recalculated ? "ok" : "warn",
+                      text: result.recalculated
+                        ? `Кошторис перераховано. ${result.understood}`
+                        : `Уточнення збережено, але кошторис не перераховано. ${result.understood}`,
+                    });
+                    if (result.estimate_id) {
+                      setLastEstimate(result.estimate_id);
+                    }
+                  }}
+                />
               ))}
               <div className="small muted">
-                Система не обирає варіант самостійно — відповідь дається у розділі «Питання».
+                Система не обирає варіант самостійно. Напишіть або надиктуйте уточнення —
+                воно стане зміною показника, а кошторис перерахується за правилами шаблону.
               </div>
             </div>
           </Card>
@@ -454,5 +499,194 @@ function ListCard({ title, items, tone }: { title: string; items: string[]; tone
         </ul>
       )}
     </Card>
+  );
+}
+
+/**
+ * One conflict, with the box the estimator answers it in.
+ *
+ * Typing always works. Dictation needs `navigator.mediaDevices`, which browsers
+ * expose only in a secure context — HTTPS or localhost. The app is currently
+ * served over plain HTTP on an IP address, so the microphone is hidden there
+ * rather than offered as a button that throws; the note says why.
+ */
+function ConflictCard({
+  conflict,
+  index,
+  projectId,
+  voiceAvailable,
+  onResolved,
+}: {
+  conflict: Conflict;
+  index: number;
+  projectId: number;
+  voiceAvailable: boolean;
+  onResolved: (result: ResolveResult) => void;
+}) {
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<ResolveResult | null>(null);
+
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+
+  const secureContextOk =
+    typeof navigator !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia);
+  const canRecord = voiceAvailable && secureContextOk;
+
+  const extensionFor = (mime: string) => {
+    if (mime.includes("ogg")) return "ogg";
+    if (mime.includes("mp4") || mime.includes("m4a")) return "mp4";
+    if (mime.includes("mpeg")) return "mp3";
+    if (mime.includes("wav")) return "wav";
+    return "webm";
+  };
+
+  const stopRecording = () => {
+    recorderRef.current?.stop();
+    setRecording(false);
+  };
+
+  const startRecording = async () => {
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        // Release the microphone as soon as we have the audio, so the browser
+        // stops showing the recording indicator.
+        stream.getTracks().forEach((t) => t.stop());
+        const mime = recorder.mimeType || "audio/webm";
+        const blob = new Blob(chunksRef.current, { type: mime });
+        if (blob.size === 0) {
+          setError("Запис порожній — мікрофон не дав звуку.");
+          return;
+        }
+        setTranscribing(true);
+        try {
+          const { text } = await api.transcribe(blob, `clarification.${extensionFor(mime)}`);
+          if (!text) {
+            setError("Не вдалося розібрати мову. Спробуйте ще раз або впишіть текстом.");
+            return;
+          }
+          setComment((prev) => (prev ? `${prev.trim()} ${text}` : text));
+        } catch (e) {
+          setError((e as Error).message);
+        } finally {
+          setTranscribing(false);
+        }
+      };
+
+      recorder.start();
+      recorderRef.current = recorder;
+      setRecording(true);
+    } catch (e) {
+      setError(`Немає доступу до мікрофона: ${(e as Error).message}`);
+      setRecording(false);
+    }
+  };
+
+  const apply = async () => {
+    if (!comment.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.resolveIssue(projectId, index, comment.trim());
+      setResult(res);
+      onResolved(res);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resolved = conflict.resolved || result?.resolved;
+
+  return (
+    <Notice tone={resolved ? "ok" : "warn"} title={conflict.topic}>
+      <div>Варіанти: {conflict.values.join(" / ")}</div>
+      {conflict.impact && <div className="small muted">Вплив: {conflict.impact}</div>}
+      {conflict.question && <div style={{ marginTop: 6 }}><strong>{conflict.question}</strong></div>}
+      <div className="small muted mono" style={{ marginTop: 4 }}>
+        Код: conflict#{index}
+      </div>
+
+      {resolved && (
+        <div style={{ marginTop: 8 }}>
+          <span className="badge ok">Вирішено</span>{" "}
+          {(conflict.resolution || comment) && (
+            <span className="small">«{conflict.resolution || comment}»</span>
+          )}
+          {(result?.understood || conflict.resolution_understood) && (
+            <div className="small muted" style={{ marginTop: 4 }}>
+              Зрозуміло як: {result?.understood || conflict.resolution_understood}
+            </div>
+          )}
+        </div>
+      )}
+
+      {result && result.changes.length > 0 && (
+        <ul className="small" style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+          {result.changes.map((c, i) => <li key={i}>{c}</li>)}
+        </ul>
+      )}
+      {result && result.changes.length === 0 && (
+        <div className="small muted" style={{ marginTop: 6 }}>
+          Змін до показників не виявлено, тож кошторис не перераховувався.
+          {result.unresolved && <> {result.unresolved}</>}
+        </div>
+      )}
+
+      <div style={{ marginTop: 10 }}>
+        <textarea
+          value={comment}
+          rows={3}
+          placeholder="Введіть уточнення або донесіть відсутні дані…"
+          onChange={(e) => setComment(e.target.value)}
+          disabled={busy}
+          style={{ width: "100%" }}
+        />
+      </div>
+
+      <div className="row" style={{ marginTop: 8, alignItems: "center" }}>
+        {canRecord && (
+          <button
+            onClick={recording ? stopRecording : startRecording}
+            disabled={busy || transcribing}
+            className={recording ? "danger" : ""}
+            title={recording ? "Зупинити запис" : "Надиктувати уточнення"}
+          >
+            {recording ? "⏹ Зупинити" : "🎤 Надиктувати"}
+          </button>
+        )}
+        <button className="primary" onClick={apply} disabled={busy || !comment.trim()}>
+          {busy ? "Перерахунок…" : "Оновити кошторис"}
+        </button>
+        {transcribing && <Spinner label="Розпізнавання…" />}
+        {recording && <span className="small">Запис триває…</span>}
+      </div>
+
+      {!voiceAvailable && (
+        <div className="small muted" style={{ marginTop: 6 }}>
+          Голосове введення вимкнено: на сервері не налаштовано OPENAI_API_KEY.
+        </div>
+      )}
+      {voiceAvailable && !secureContextOk && (
+        <div className="small muted" style={{ marginTop: 6 }}>
+          Мікрофон недоступний: браузер дозволяє запис лише через HTTPS. Уточнення
+          можна ввести текстом — на розрахунок це не впливає.
+        </div>
+      )}
+      {error && <div className="small" style={{ marginTop: 6, color: "#b42318" }}>{error}</div>}
+    </Notice>
   );
 }

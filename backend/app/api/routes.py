@@ -46,6 +46,7 @@ from ..schemas import (
     BulkDismiss,
     BulkSameAnswer,
     EstimateCreate,
+    IssueResolve,
     LineCreate,
     LineUpdate,
     OptionsUpdate,
@@ -119,6 +120,10 @@ def health(session: Session = Depends(get_session)) -> dict[str, Any]:
         "quantity_rules": rules,
         "ai_available": AIClient(settings).available,
         "ai_model": settings.ai_model,
+        # The clarification box hides its microphone when this is false, rather
+        # than offering a button that can only fail.
+        "voice_available": bool(settings.openai_api_key),
+        "voice_model": settings.openai_transcribe_model,
     }
 
 
@@ -989,6 +994,73 @@ def export_pdf(estimate_id: int, session: Session = Depends(get_session)):
         section_order=layout.order,
     )
     return FileResponse(target, media_type="application/pdf", filename=target.name)
+
+
+# --- clarifications: voice in, structured edits out ---------------------------
+
+
+@router.post("/audio/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Speech to text for the clarification box, via OpenAI Whisper."""
+    from ..services.ai.openai_speech import OpenAIClient, OpenAIUnavailable
+
+    client = OpenAIClient(settings)
+    if not client.available:
+        raise HTTPException(503, "Не налаштовано OPENAI_API_KEY — голосове введення вимкнено.")
+
+    limit = settings.max_audio_mb * 1024 * 1024
+    declared = None
+    if hasattr(file, "size") and file.size:
+        declared = file.size
+    if declared and declared > limit:
+        raise HTTPException(413, f"Запис довший за {settings.max_audio_mb} МБ.")
+
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(400, "Порожній аудіозапис.")
+    if len(audio) > limit:
+        raise HTTPException(413, f"Запис довший за {settings.max_audio_mb} МБ.")
+
+    try:
+        text = client.transcribe(audio, filename=file.filename or "clarification.webm")
+    except OpenAIUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    return {"text": text, "chars": len(text)}
+
+
+@router.post("/projects/{project_id}/issues/{issue_id}/resolve")
+def resolve_issue(
+    project_id: int,
+    issue_id: int,
+    payload: IssueResolve,
+    session: Session = Depends(get_session),
+):
+    """Apply a written or dictated clarification, then rebuild the estimate.
+
+    ``issue_id`` is the conflict's position in the analysis: conflicts are a
+    JSON list on the object analysis, not rows, so they have no id of their own.
+    """
+    from ..services.ai.openai_speech import OpenAIClient, OpenAIUnavailable
+    from ..services.resolution import ConflictNotFound, resolve_conflict
+
+    project = _project(session, project_id)
+    comment = payload.comment.strip()
+    if not comment:
+        raise HTTPException(400, "Порожнє уточнення — нема чого застосовувати.")
+
+    client = OpenAIClient(settings)
+    if not client.available:
+        raise HTTPException(503, "Не налаштовано OPENAI_API_KEY — розбір уточнень вимкнено.")
+
+    try:
+        return resolve_conflict(
+            session, project, issue_id, comment, client=client, rebuild=payload.recalculate
+        )
+    except ConflictNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except OpenAIUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 # --- jobs --------------------------------------------------------------------

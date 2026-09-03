@@ -150,3 +150,42 @@ def test_api_client_exposes_the_pdf_endpoint() -> None:
     source = read("api.ts")
     assert "exportPdfUrl" in source
     assert "/export/pdf" in source
+
+
+# --- 5. clarification box under a conflict ------------------------------------
+
+
+def test_conflict_cards_carry_a_clarification_box() -> None:
+    source = read("pages", "AnalysisView.tsx")
+
+    assert "Введіть уточнення або донесіть відсутні дані…" in source, (
+        "the textarea placeholder the estimator was promised is missing"
+    )
+    assert "Оновити кошторис" in source, "no apply button on the conflict card"
+    assert "<textarea" in source
+    assert "api.resolveIssue(projectId, index" in source, (
+        "the apply button must post to the conflict it sits under"
+    )
+
+
+def test_the_microphone_uses_mediarecorder_and_degrades_honestly() -> None:
+    source = read("pages", "AnalysisView.tsx")
+
+    assert "MediaRecorder" in source and "getUserMedia" in source
+    assert "api.transcribe(" in source, "recorded audio must reach the backend"
+    assert "setComment(" in source, "the transcript must land in the textarea"
+
+    # getUserMedia only exists in a secure context; the app is served over
+    # plain HTTP, so the button must be hidden with an explanation rather than
+    # offered and then throwing.
+    assert "secureContextOk" in source
+    assert "лише через HTTPS" in source
+    # And hidden entirely when the server has no key for Whisper.
+    assert "voiceAvailable" in source
+
+
+def test_api_client_exposes_transcribe_and_resolve() -> None:
+    source = read("api.ts")
+    assert "/audio/transcribe" in source
+    assert "/issues/${issueId}/resolve" in source
+    assert "resolveIssue" in source and "transcribe:" in source
