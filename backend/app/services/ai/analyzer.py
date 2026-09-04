@@ -35,6 +35,13 @@ log = logging.getLogger(__name__)
 
 ProgressFn = Callable[[float, str], None]
 
+# The aggregation prompt carries every page's findings. claude-opus-5 has a 1M
+# context window, so the old 180 000-character cap left the window mostly unused
+# while quietly dropping pages off the end of a large drawing set. 900 000
+# characters is roughly 300K tokens of Cyrillic - comfortably inside the window,
+# and past what any realistic set produces.
+MAX_FINDINGS_CHARS = 900_000
+
 # Added to the aggregation prompt on the second pass, when the first found no
 # page worth aggregating. It lowers the evidence bar without licensing
 # invention: a guessed area must arrive labelled as a guess, so the estimator
@@ -129,7 +136,7 @@ class DocumentAnalyzer:
                 schema_model=PageFindings,
                 system=PAGE_ANALYSIS_SYSTEM,
                 content=parts,
-                max_tokens=8000,
+                max_tokens=16000,
             )
             return PageResult(page.page_number, findings, used_vision=used_vision)
         except AIUnavailable as exc:
@@ -303,12 +310,23 @@ class DocumentAnalyzer:
                 }
             )
 
+        findings_json = json.dumps(payload, ensure_ascii=False)
+        if len(findings_json) > MAX_FINDINGS_CHARS:
+            # Say it out loud. Silently dropping the tail means whole pages of
+            # quantities vanish from the estimate with nothing in the log.
+            log.warning(
+                "page findings are %d characters, over the %d cap - input will "
+                "be cut before aggregation (%d pages carried findings)",
+                len(findings_json), MAX_FINDINGS_CHARS, len(payload),
+            )
+            findings_json = findings_json[:MAX_FINDINGS_CHARS]
+
         shared = (
             "Файли: " + ", ".join(sorted(set(names.values())))
             + (f"\n\nТехнічне завдання від замовника:\n{brief}" if brief.strip() else "")
             + (LENIENT_PREAMBLE if lenient else "")
             + "\n\nРезультати посторінкового аналізу:\n"
-            + json.dumps(payload, ensure_ascii=False)[:180000]
+            + findings_json
         )
 
         def call(model: type, task: str, max_tokens: int):
@@ -326,7 +344,7 @@ class DocumentAnalyzer:
                 "(площі, довжини, кількості), потрібні секції кошторису та зони. "
                 "Показник, що трапляється на кількох сторінках з різними значеннями, "
                 "познач як status = needs_user_input.",
-                12000,
+                32000,
             )
             schedules = call(
                 ScheduleModel,
@@ -334,13 +352,13 @@ class DocumentAnalyzer:
                 "елементів покриття. Об'єднай дублікати однієї позиції й підсумуй "
                 "кількості з дендроплану. Позиції з приміткою «існуючі» залиши у списку, "
                 "але з is_existing = true.",
-                12000,
+                32000,
             )
             review = call(
                 ReviewModel,
                 "ЗАВДАННЯ ЦЬОГО КРОКУ: перелічи припущення, невідоме, ризики, конфлікти "
                 "даних і питання користувачу. Не більше 8 питань, згрупованих за темою.",
-                10000,
+                24000,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("aggregation failed")

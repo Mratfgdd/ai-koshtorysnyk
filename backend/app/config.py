@@ -107,7 +107,14 @@ class Settings(BaseSettings):
     ai_model: str = "claude-opus-5"
     ai_model_cheap: str = "claude-haiku-4-5"
     ai_effort: str = "high"
-    ai_max_tokens: int = 16000
+    # claude-opus-5 allows up to 128K output tokens. 16000 was not enough for a
+    # 46-page drawing set: the site model stopped mid-string at ~25 000
+    # characters and the JSON would not parse. Requests stream, so a large
+    # ceiling costs nothing when the answer is short — only what is generated
+    # is billed.
+    ai_max_tokens: int = 32000
+    # How far a retry may raise the budget after a response hits the cap.
+    ai_max_tokens_ceiling: int = 96000
     ai_max_concurrency: int = 6
     ai_enabled: bool = True
 
