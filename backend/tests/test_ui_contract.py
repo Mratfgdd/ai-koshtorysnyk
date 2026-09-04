@@ -184,6 +184,37 @@ def test_the_microphone_uses_mediarecorder_and_degrades_honestly() -> None:
     assert "voiceAvailable" in source
 
 
+def test_the_microphone_is_an_icon_in_the_textarea_corner() -> None:
+    """A compact icon, not a labelled button taking a row of its own."""
+    source = read("pages", "AnalysisView.tsx")
+
+    assert "mic-btn" in source and "mic-field" in source
+    assert "<MicIcon />" in source and "<StopIcon />" in source
+    assert "function MicIcon()" in source and "<svg" in source
+
+    # An icon-only control still has to be announceable and toggle-aware.
+    assert "aria-label=" in source
+    assert "aria-pressed={recording}" in source
+    assert "title={" in source
+
+    # The old wording must be gone from the control itself.
+    assert "🎤 Надиктувати" not in source
+    assert "⏹ Зупинити" not in source
+
+
+def test_the_microphone_icon_has_its_states_styled() -> None:
+    css = read("styles.css")
+
+    assert ".mic-field { position: relative; }" in css, "no positioning context for the icon"
+    assert ".mic-field textarea { padding-right" in css, (
+        "text must not run underneath the icon"
+    )
+    assert ".mic-btn" in css and ".mic-btn:hover" in css
+    assert ".mic-btn.recording" in css and "mic-pulse" in css, "no recording animation"
+    assert ".mic-btn.thinking" in css, "no transcribing state"
+    assert "prefers-reduced-motion" in css, "animation must be opt-out"
+
+
 def test_api_client_exposes_transcribe_and_resolve() -> None:
     source = read("api.ts")
     assert "/audio/transcribe" in source

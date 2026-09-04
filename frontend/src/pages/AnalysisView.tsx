@@ -646,33 +646,41 @@ function ConflictCard({
         </div>
       )}
 
-      <div style={{ marginTop: 10 }}>
+      <div className="mic-field" style={{ marginTop: 10 }}>
         <textarea
           value={comment}
           rows={3}
           placeholder="Введіть уточнення або донесіть відсутні дані…"
           onChange={(e) => setComment(e.target.value)}
           disabled={busy}
-          style={{ width: "100%" }}
         />
+        {canRecord && (
+          <button
+            type="button"
+            className={`mic-btn${recording ? " recording" : ""}${transcribing ? " thinking" : ""}`}
+            onClick={recording ? stopRecording : startRecording}
+            disabled={busy || transcribing}
+            aria-label={recording ? "Зупинити запис" : "Надиктувати уточнення"}
+            aria-pressed={recording}
+            title={
+              transcribing
+                ? "Розпізнавання…"
+                : recording
+                  ? "Зупинити запис"
+                  : "Надиктувати уточнення"
+            }
+          >
+            {recording ? <StopIcon /> : <MicIcon />}
+          </button>
+        )}
       </div>
 
       <div className="row" style={{ marginTop: 8, alignItems: "center" }}>
-        {canRecord && (
-          <button
-            onClick={recording ? stopRecording : startRecording}
-            disabled={busy || transcribing}
-            className={recording ? "danger" : ""}
-            title={recording ? "Зупинити запис" : "Надиктувати уточнення"}
-          >
-            {recording ? "⏹ Зупинити" : "🎤 Надиктувати"}
-          </button>
-        )}
         <button className="primary" onClick={apply} disabled={busy || !comment.trim()}>
           {busy ? "Перерахунок…" : "Оновити кошторис"}
         </button>
-        {transcribing && <Spinner label="Розпізнавання…" />}
-        {recording && <span className="small">Запис триває…</span>}
+        {recording && <span className="small" style={{ color: "var(--error)" }}>Запис триває…</span>}
+        {transcribing && <span className="small muted">Розпізнавання…</span>}
       </div>
 
       {!voiceAvailable && (
@@ -688,5 +696,32 @@ function ConflictCard({
       )}
       {error && <div className="small" style={{ marginTop: 6, color: "#b42318" }}>{error}</div>}
     </Notice>
+  );
+}
+
+
+/**
+ * Inline SVG rather than an icon package: two glyphs do not justify a
+ * dependency, and inlining keeps them themable through currentColor.
+ * Both are 24x24 on the Lucide grid, stroke-based, so they sit correctly
+ * next to the rest of the interface.
+ */
+function MicIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+         strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" y1="19" x2="12" y2="22" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"
+         aria-hidden="true" focusable="false">
+      <rect x="7" y="7" width="10" height="10" rx="2" />
+    </svg>
   );
 }
