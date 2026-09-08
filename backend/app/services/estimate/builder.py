@@ -9,7 +9,12 @@ The flow mirrors how the client fills their own workbook:
    (plants, slabs, edging, coverage areas).
 4. Let the rule engine derive everything else -- aggregates, sand and gravel
    volumes, fabric with its 20% overlap, fixings, deliveries, labour.
-5. Price every line from the catalog by exact name, exactly like their VLOOKUP.
+5. Price every line from the catalog by exact name, exactly like their VLOOKUP,
+   then take the price the article was **last sold** at where the issued
+   proposals carry one. That order is the client's rule and their data's:
+   the base quotes no price at all for its 202 plants, and where an article has
+   been invoiced since the base was written, the invoice is the newer figure.
+   See :mod:`app.services.history.prices`.
 
 Sections with no positive quantity disappear from the output, which is why
 their five sample proposals each show a different set of sections.
@@ -27,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from ...config import get_settings
 from ..catalog.search import CatalogSearch, MatchResult
+from ..history.prices import InvoicedPrices, LastPrice
 from ..rules.engine import Draft, DraftLine, RuleEngine, RuleOutcome, normalize_name
 from ..rules.totals import EstimateTotals, compute_totals
 
@@ -41,6 +47,8 @@ class BuildResult:
     outcomes: list[RuleOutcome] = field(default_factory=list)
     unmatched: list[dict[str, Any]] = field(default_factory=list)
     ambiguous: list[dict[str, Any]] = field(default_factory=list)
+    # Lines whose price came from an issued proposal rather than the price base.
+    repriced: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -93,11 +101,33 @@ class TemplateLayout:
 
 
 class EstimateBuilder:
-    def __init__(self, session: Session, layout: TemplateLayout | None = None):
+    def __init__(
+        self,
+        session: Session,
+        layout: TemplateLayout | None = None,
+        *,
+        use_invoiced_prices: bool = True,
+        prices: InvoicedPrices | None = None,
+    ):
         self.session = session
         self.layout = layout or TemplateLayout.load()
         self.catalog = CatalogSearch(session)
         self.engine = RuleEngine(self.layout.data)
+        # Off leaves the catalogue price standing, which is what a machine with
+        # no imported proposals gets anyway. Kept as a switch so the effect of
+        # the rule can be measured against the same project both ways.
+        self.use_invoiced_prices = use_invoiced_prices
+        # A caller may supply the history instead of the stored one -- measuring
+        # a project against its own signed proposal has to exclude that proposal
+        # from the prices, or the answer is circular.
+        self._prices = prices
+
+    @property
+    def prices(self) -> InvoicedPrices:
+        """The last sold price of every article, loaded once per builder."""
+        if self._prices is None:
+            self._prices = InvoicedPrices.from_db(self.session)
+        return self._prices
 
     # -- construction ---------------------------------------------------------
     def build(
@@ -164,9 +194,16 @@ class EstimateBuilder:
                 line.quantity = float(qty)
                 line.qty_source = "document"
                 line.locked = True  # a stated number is not the rules' to change
+                # Added to, never replaced: where the quantity came from is a
+                # different question from where the price came from, and the
+                # line already carries the answer to the second one.
                 ref_key = f"{key}|{normalize_name(name)}"
-                line.source_refs = source_refs.get(ref_key, source_refs.get(normalize_name(name), []))
-                line.reasons = reasons.get(ref_key, reasons.get(normalize_name(name), []))
+                line.source_refs += source_refs.get(
+                    ref_key, source_refs.get(normalize_name(name), [])
+                )
+                line.reasons += reasons.get(
+                    ref_key, reasons.get(normalize_name(name), [])
+                )
 
         result.outcomes = self.engine.apply(draft)
 
@@ -218,7 +255,69 @@ class EstimateBuilder:
             result.unmatched.append(
                 {"section": line.section, "name": line.name, "reason": match.reason}
             )
+
+        self._apply_last_sold(line, match, result)
         return match
+
+    def _apply_last_sold(
+        self, line: DraftLine, match: MatchResult, result: BuildResult
+    ) -> LastPrice | None:
+        """Overwrite the list price with what the article was last sold for.
+
+        Looked up under the catalogue's own name when there is a match, because
+        the invoices and the base agree on wording far more often than a
+        drawing and the base do. Only the price moves: unit cost stays with the
+        catalogue, since an invoice records what was charged, not what it cost.
+        """
+        if not self.use_invoiced_prices:
+            return None
+        item = match.best.item if match.best is not None else None
+        name = item.name if item is not None and match.status == "matched" else line.name
+
+        last = self.prices.lookup(name, unit=line.unit)
+        if last is None or last.unit_price <= 0:
+            return None
+
+        was = line.unit_price
+        line.unit_price = last.unit_price
+        if not line.unit:
+            line.unit = last.unit
+        line.source_refs.append(
+            {
+                "source_type": "historical_estimate",
+                "source_ref": last.project,
+                "detail": last.trace(),
+            }
+        )
+        if was > 0 and abs(was - last.unit_price) >= 0.005:
+            line.reasons.append(
+                f"Ціна за останнім виданим КП: {last.unit_price:g} "
+                f"(у базі {was:g})."
+            )
+            result.repriced.append(
+                {
+                    "section": line.section,
+                    "name": line.name,
+                    "catalog_price": was,
+                    "invoiced_price": last.unit_price,
+                    **last.to_dict(),
+                }
+            )
+        elif was <= 0:
+            line.confidence = match.confidence if match.status == "matched" else "medium"
+            line.reasons.append(
+                f"У базі ціни немає; взято останню продану: {last.unit_price:g}."
+            )
+            result.repriced.append(
+                {
+                    "section": line.section,
+                    "name": line.name,
+                    "catalog_price": 0.0,
+                    "invoiced_price": last.unit_price,
+                    **last.to_dict(),
+                }
+            )
+        return last
 
     def _add_plants(
         self, draft: Draft, plants: list[dict[str, Any]], result: BuildResult
@@ -242,16 +341,19 @@ class EstimateBuilder:
             line.reasons = [r for r in [entry.get("reason")] if r]
             line.source_refs = list(entry.get("source_refs") or [])
             self._price(line, result)
-            if line.match_status != "matched":
+            if line.match_status != "matched" and line.unit_price <= 0:
                 line.reasons.append(
-                    "Позиції немає в каталозі під цією назвою — потрібно обрати аналог."
+                    "Позиції немає ні в каталозі, ні серед проданих — "
+                    "потрібно обрати аналог або внести ціну."
                 )
             elif line.unit_price <= 0:
-                # The client's assortment sheet lists plants without prices:
-                # nursery quotes are set per project. Flag, never guess.
+                # The client's assortment sheet lists plants without prices --
+                # nursery quotes are set per project -- and this one has never
+                # been invoiced either. Flag, never guess.
                 line.confidence = "low"
                 line.reasons.append(
-                    "У базі рослин ціни не ведуться — потрібно внести ціну постачальника."
+                    "У базі рослин ціни не ведуться, і в історії КП ця рослина не "
+                    "зустрічається — потрібно внести ціну постачальника."
                 )
             draft.lines.append(line)
 
