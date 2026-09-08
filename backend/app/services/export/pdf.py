@@ -328,18 +328,23 @@ def _subset_fonts(path: Path) -> None:
     which ~1.15 MB was two complete Nimbus Sans faces. Subsetting takes the same
     document to ~143 KB, which matters because this file gets emailed.
 
+    The whole thing happens in memory. Reopening the file we have just written
+    and swapping a temporary over it is denied on Windows: MuPDF still holds the
+    handle the DocumentWriter opened, so ``os.replace`` fails with WinError 5 and
+    every proposal shipped at its full 1.3 MB. Reading the bytes, subsetting the
+    copy and writing the bytes back takes no second handle on the file.
+
     Best-effort: a failure here costs size, not correctness, so the full-size
     document is kept rather than losing the export.
     """
-    tmp = path.with_name(path.name + ".tmp")
     try:
-        doc = pymupdf.open(path)
+        doc = pymupdf.open("pdf", path.read_bytes())
         try:
             doc.subset_fonts()
-            doc.save(tmp, garbage=4, deflate=True)
+            data = doc.tobytes(garbage=4, deflate=True)
         finally:
             doc.close()
-        tmp.replace(path)
+        path.write_bytes(data)
     except Exception:  # pragma: no cover - depends on the MuPDF build
-        log.warning("font subsetting failed for %s; keeping the full-size PDF", path)
-        tmp.unlink(missing_ok=True)
+        log.warning("font subsetting failed for %s; keeping the full-size PDF", path,
+                    exc_info=True)
