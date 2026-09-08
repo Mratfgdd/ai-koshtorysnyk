@@ -230,6 +230,28 @@ bash deploy/vps/redeploy.sh
 перезапускає `estimator`. `.env` і `/var/lib/estimator` він не чіпає, тож ключ
 API і база лишаються на місці. Попередня версія лежить у `/opt/estimator/src.old`.
 
+### Історія цін окремо від коду
+
+Ціни з виданих КП живуть у базі, а не в репозиторії, тож `redeploy.sh` їх не
+везе — самі КП це документи замовника і в git їх немає. Після першого
+розгортання цієї версії їх треба завезти один раз:
+
+```bash
+scp -r "тека з папками об'єктів" root@45.94.157.110:/var/lib/estimator/references
+ssh root@45.94.157.110 \
+  '/opt/estimator/venv/bin/python /opt/estimator/src/scripts/import_references.py \
+   /var/lib/estimator/references'
+```
+
+І повторювати щоразу, коли видали нове КП. Поки цього не зроблено, система
+працює, але рахує лише за прайсом «2026 База 1» — тобто без цін на рослини.
+Перевірити, чи історія на місці:
+
+```bash
+ssh root@45.94.157.110 \
+  "sqlite3 /var/lib/estimator/estimator.db 'select count(*) from historical_lines'"
+```
+
 Вручну те саме:
 
 ```bash
