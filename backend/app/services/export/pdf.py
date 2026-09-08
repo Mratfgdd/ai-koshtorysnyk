@@ -25,6 +25,7 @@ import pymupdf
 
 from ..rules.engine import Draft, DraftLine
 from ..rules.totals import EstimateTotals
+from .labels import bare_name, marker_label
 from .xlsx import (
     BAND_BLUE,
     BAND_GREEN,
@@ -83,8 +84,11 @@ class _Section:
 
     @property
     def label(self) -> str:
-        low = self.title.lower()
-        return self.title if low.startswith(("підготовчий", "рахунок")) else f"Рахунок {self.title}"
+        return marker_label(self.title)
+
+    @property
+    def name(self) -> str:
+        return bare_name(self.title)
 
     @property
     def materials(self) -> float:
@@ -224,7 +228,7 @@ def build_html(
         parts.append(f"<table>{COLGROUP}")
         if len([b for b in section.blocks if b.kind in ("materials", "plants")]) > 1:
             parts.append(_subtotal("Разом матеріали та рослини:", section.materials))
-        parts.append(_subtotal(f"Разом {section.title}:", section.total, strong=True))
+        parts.append(_subtotal(f"Разом {section.name}:", section.total, strong=True))
         parts.append("</table>")
 
     # --- Рахунок загальний ---------------------------------------------------

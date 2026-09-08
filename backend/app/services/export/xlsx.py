@@ -41,6 +41,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from ...config import BACKEND_DIR
 from ..rules.engine import Draft, DraftLine
 from ..rules.totals import EstimateTotals
+from .labels import bare_name, marker_label
 from ..validation.validators import ERROR, NEEDS_USER_INPUT, WARNING, ValidationReport
 
 # --- brand -------------------------------------------------------------------
@@ -386,7 +387,7 @@ def _write_section(
     flags: dict[str, str],
     fx: _Formulas,
 ) -> tuple[int, int, int]:
-    label = title if title.lower().startswith(("підготовчий", "рахунок")) else f"Рахунок {title}"
+    label = marker_label(title)
 
     # Pale blue marker band, left portion only -- as in the source proposal.
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
@@ -446,7 +447,7 @@ def _write_section(
     section_amount = (material_amount if material_anchor else 0.0) + (
         amounts.get("works", 0.0) if works_row else 0.0
     )
-    row = _write_subtotal(ws, row, f"Разом {title}:", "+".join(parts) or "0",
+    row = _write_subtotal(ws, row, f"Разом {bare_name(title)}:", "+".join(parts) or "0",
                           section_amount, fx, strong=True)
     return row, material_anchor, works_row
 
