@@ -277,6 +277,14 @@ def test_shipped_data_is_not_gitignored() -> None:
     A bare `data/` rule matches `backend/app/data/` as well, which silently
     excluded the rule pack, the catalog seed and the logo — the deploy would
     boot with zero rules and an empty catalog.
+
+    This asks git what it would do with a path, so it can only run inside a
+    working copy. On the server there is none: redeploy.sh packs the tree with
+    `--exclude='./.git'`, deliberately, because the deployment has no business
+    carrying the history. There `git check-ignore` exits 128 for every path,
+    which the old helper could not tell apart from "not ignored" — so the suite
+    on the server reported `.env must never be committed` about a `.gitignore`
+    that has listed `.env` all along.
     """
     import subprocess
 
@@ -289,21 +297,37 @@ def test_shipped_data_is_not_gitignored() -> None:
     ]
     must_not_ship = [".env", "data/estimator.db", "backend/estimator.db"]
 
-    def ignored(path: str) -> bool:
+    def check_ignore(path: str) -> int:
+        """git's own verdict: 0 ignored, 1 not ignored, anything else broken."""
         return subprocess.run(
             ["git", "check-ignore", "-q", path], cwd=ROOT, capture_output=True
-        ).returncode == 0
+        ).returncode
 
     try:
-        subprocess.run(["git", "--version"], capture_output=True, check=True)
-    except (OSError, subprocess.CalledProcessError):  # pragma: no cover
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+    except OSError:  # pragma: no cover - git is not installed
         pytest.skip("git unavailable")
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        pytest.skip(f"{ROOT} is not a git working copy — nothing to ask git about")
 
     for path in must_ship:
         if (ROOT / path).exists():
-            assert not ignored(path), f"{path} is gitignored but the deploy needs it"
+            code = check_ignore(path)
+            assert code == 1, (
+                f"{path} is gitignored but the deploy needs it"
+                if code == 0
+                else f"git check-ignore {path} failed with {code}"
+            )
     for path in must_not_ship:
-        assert ignored(path), f"{path} must never be committed"
+        code = check_ignore(path)
+        assert code == 0, (
+            f"{path} must never be committed"
+            if code == 1
+            else f"git check-ignore {path} failed with {code}"
+        )
 
 
 def test_vercel_json_serves_the_spa() -> None:
