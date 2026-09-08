@@ -47,6 +47,14 @@ class AnalysisUpdate(BaseModel):
     status: str | None = None
 
 
+class IssueResolve(BaseModel):
+    """A clarification typed or dictated under a conflict card."""
+
+    comment: str = Field(min_length=1, max_length=4000)
+    # Off only for testing the interpretation without paying for a plan call.
+    recalculate: bool = True
+
+
 class EstimateCreate(BaseModel):
     sections: list[str] = Field(default_factory=list)
     quantities: dict[str, dict[str, float]] = Field(default_factory=dict)

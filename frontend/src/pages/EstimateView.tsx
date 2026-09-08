@@ -130,6 +130,7 @@ export default function EstimateView() {
         <div className="row">
           <button onClick={() => run(() => api.recalculate(id))} disabled={busy}>Перерахувати</button>
           <button onClick={approve} disabled={busy}>Затвердити</button>
+          <a className="btn" href={api.exportPdfUrl(id)}>Завантажити PDF</a>
           <a className="btn btn-primary" href={api.exportUrl(id)}>Експорт у XLSX</a>
         </div>
       </div>

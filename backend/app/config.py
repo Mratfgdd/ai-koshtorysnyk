@@ -88,12 +88,33 @@ class Settings(BaseSettings):
     rules_dir: Path = BACKEND_DIR / "app" / "data" / "rules"
     template_layout_file: str = "template_layout.json"
 
+    # --- OpenAI --------------------------------------------------------------
+    # Used only for the two things it was asked for: speech-to-text on the
+    # clarification recorder, and turning a free-text clarification into
+    # structured edits. Document understanding stays on Anthropic.
+    #
+    # pydantic-settings reads OPENAI_API_KEY from the environment and from
+    # .env, so `os.getenv("OPENAI_API_KEY")` and this field see the same value.
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
+    openai_transcribe_model: str = "whisper-1"
+    # Whisper's own cap is 25 MB; a clarification is seconds long, so anything
+    # near that is a stuck recorder rather than speech.
+    max_audio_mb: int = 20
+
     # --- AI ------------------------------------------------------------------
     anthropic_api_key: str = ""
     ai_model: str = "claude-opus-5"
     ai_model_cheap: str = "claude-haiku-4-5"
     ai_effort: str = "high"
-    ai_max_tokens: int = 16000
+    # claude-opus-5 allows up to 128K output tokens. 16000 was not enough for a
+    # 46-page drawing set: the site model stopped mid-string at ~25 000
+    # characters and the JSON would not parse. Requests stream, so a large
+    # ceiling costs nothing when the answer is short — only what is generated
+    # is billed.
+    ai_max_tokens: int = 32000
+    # How far a retry may raise the budget after a response hits the cap.
+    ai_max_tokens_ceiling: int = 96000
     ai_max_concurrency: int = 6
     ai_enabled: bool = True
 

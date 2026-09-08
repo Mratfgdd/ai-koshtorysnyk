@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api";
+import { api, type Project } from "../api";
 import { Card, Empty, Modal, Notice, Spinner, StatusTag, useAsync } from "../components";
 
 export default function Projects() {
@@ -9,6 +9,36 @@ export default function Projects() {
   const [form, setForm] = useState({ name: "", client_name: "", address: "", manager: "", brief: "" });
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+
+  // Uploading straight from the list saves opening the project first, which is
+  // the whole point of the button in the row.
+  const [uploadTo, setUploadTo] = useState<Project | null>(null);
+  const [uploading, setUploading] = useState<string[]>([]);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const uploadFiles = async (project: Project, files: FileList | File[]) => {
+    const list = Array.from(files).filter((f) => f.name.toLowerCase().endsWith(".pdf"));
+    const rejected = Array.from(files).length - list.length;
+    setUploadError(rejected > 0 ? `Пропущено ${rejected} файл(ів): підтримуються лише PDF.` : null);
+    if (list.length === 0) return;
+
+    const uploaded: string[] = [];
+    for (const file of list) {
+      setUploading((u) => [...u, file.name]);
+      try {
+        await api.uploadDocument(project.id, file);
+        uploaded.push(file.name);
+      } catch (e) {
+        setUploadError(`${file.name}: ${(e as Error).message}`);
+      } finally {
+        setUploading((u) => u.filter((n) => n !== file.name));
+      }
+    }
+    if (uploaded.length) setDone(`Завантажено до «${project.name}»: ${uploaded.join(", ")}`);
+    reload();
+  };
 
   const create = async () => {
     if (!form.name.trim()) return;
@@ -43,6 +73,7 @@ export default function Projects() {
       </div>
 
       {error && <Notice tone="error" title="Помилка">{error}</Notice>}
+      {done && <Notice tone="ok">{done}</Notice>}
 
       <Card tight>
         {loading ? (
@@ -62,6 +93,7 @@ export default function Projects() {
                   <th>Адреса</th>
                   <th>ПМ</th>
                   <th>Статус</th>
+                  <th>Документи</th>
                   <th className="num">Док.</th>
                   <th className="num">Кошт.</th>
                   <th />
@@ -75,6 +107,18 @@ export default function Projects() {
                     <td className="muted">{p.address || "—"}</td>
                     <td className="muted">{p.manager || "—"}</td>
                     <td><StatusTag status={p.status} /></td>
+                    <td>
+                      <button
+                        className="sm"
+                        onClick={() => {
+                          setUploadTo(p);
+                          setUploadError(null);
+                          setDone(null);
+                        }}
+                      >
+                        Завантажити проєкт
+                      </button>
+                    </td>
                     <td className="num">{p.document_count}</td>
                     <td className="num">{p.estimate_count}</td>
                     <td className="num">
@@ -87,6 +131,52 @@ export default function Projects() {
           </div>
         )}
       </Card>
+
+      {uploadTo && (
+        <Modal
+          title={`Завантажити документи — ${uploadTo.name}`}
+          onClose={() => setUploadTo(null)}
+          footer={
+            <>
+              <button onClick={() => setUploadTo(null)}>Закрити</button>
+              <Link className="btn btn-primary" to={`/projects/${uploadTo.id}`}>
+                Відкрити проєкт
+              </Link>
+            </>
+          }
+        >
+          {uploadError && <Notice tone="error">{uploadError}</Notice>}
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/pdf"
+            multiple
+            hidden
+            onChange={(e) => e.target.files && uploadFiles(uploadTo, e.target.files)}
+          />
+          <div
+            className="drop"
+            style={{ cursor: "pointer" }}
+            onClick={() => fileRef.current?.click()}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              uploadFiles(uploadTo, e.dataTransfer.files);
+            }}
+          >
+            Перетягніть сюди креслення, концепцію або ТЗ у PDF — або натисніть, щоб обрати.
+            <div className="small" style={{ marginTop: 6 }}>
+              Великі комплекти креслень (50–60 сторінок, понад 100 МБ) підтримуються.
+            </div>
+          </div>
+          {uploading.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <Spinner label={`Завантаження: ${uploading.join(", ")}`} />
+            </div>
+          )}
+          {done && <Notice tone="ok">{done}</Notice>}
+        </Modal>
+      )}
 
       {creating && (
         <Modal

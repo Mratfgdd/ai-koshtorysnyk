@@ -46,6 +46,7 @@ from ..schemas import (
     BulkDismiss,
     BulkSameAnswer,
     EstimateCreate,
+    IssueResolve,
     LineCreate,
     LineUpdate,
     OptionsUpdate,
@@ -119,6 +120,10 @@ def health(session: Session = Depends(get_session)) -> dict[str, Any]:
         "quantity_rules": rules,
         "ai_available": AIClient(settings).available,
         "ai_model": settings.ai_model,
+        # The clarification box hides its microphone when this is false, rather
+        # than offering a button that can only fail.
+        "voice_available": bool(settings.openai_api_key),
+        "voice_model": settings.openai_transcribe_model,
     }
 
 
@@ -922,9 +927,9 @@ def catalog_match(
 # --- export ------------------------------------------------------------------
 
 
-@router.get("/estimates/{estimate_id}/export")
-def export(estimate_id: int, session: Session = Depends(get_session)):
-    from ..services.export.xlsx import ExportMeta, export_estimate
+def _export_context(estimate_id: int, session: Session, suffix: str):
+    """Everything both exporters need, so the two cannot drift apart."""
+    from ..services.export.xlsx import ExportMeta
     from ..services.rules.totals import compute_totals
 
     estimate = _estimate(session, estimate_id)
@@ -938,19 +943,30 @@ def export(estimate_id: int, session: Session = Depends(get_session)):
     out_dir = settings.data_dir / "exports"
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
     safe = "".join(c for c in (project.name if project else "kp") if c.isalnum() or c in " -_")[:60]
-    target = out_dir / f"КП {safe.strip() or 'проєкт'} v{estimate.version} {stamp}.xlsx"
+    target = out_dir / f"КП {safe.strip() or 'проєкт'} v{estimate.version} {stamp}{suffix}"
 
+    meta = ExportMeta(
+        client_name=project.client_name if project else "",
+        address=project.address if project else "",
+        project_name=project.name if project else "",
+        manager=project.manager if project else "",
+        date=dt.date.today().strftime("%d.%m.%Y"),
+    )
+    return target, draft, totals, report, meta, layout
+
+
+@router.get("/estimates/{estimate_id}/export")
+def export(estimate_id: int, session: Session = Depends(get_session)):
+    from ..services.export.xlsx import export_estimate
+
+    target, draft, totals, report, meta, layout = _export_context(
+        estimate_id, session, ".xlsx"
+    )
     export_estimate(
         target,
         draft,
         totals,
-        meta=ExportMeta(
-            client_name=project.client_name if project else "",
-            address=project.address if project else "",
-            project_name=project.name if project else "",
-            manager=project.manager if project else "",
-            date=dt.date.today().strftime("%d.%m.%Y"),
-        ),
+        meta=meta,
         section_titles=layout.titles(),
         section_order=layout.order,
         report=report,
@@ -960,6 +976,91 @@ def export(estimate_id: int, session: Session = Depends(get_session)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=target.name,
     )
+
+
+@router.get("/estimates/{estimate_id}/export/pdf")
+def export_pdf(estimate_id: int, session: Session = Depends(get_session)):
+    from ..services.export.pdf import export_estimate_pdf
+
+    target, draft, totals, _report, meta, layout = _export_context(
+        estimate_id, session, ".pdf"
+    )
+    export_estimate_pdf(
+        target,
+        draft,
+        totals,
+        meta=meta,
+        section_titles=layout.titles(),
+        section_order=layout.order,
+    )
+    return FileResponse(target, media_type="application/pdf", filename=target.name)
+
+
+# --- clarifications: voice in, structured edits out ---------------------------
+
+
+@router.post("/audio/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Speech to text for the clarification box, via OpenAI Whisper."""
+    from ..services.ai.openai_speech import OpenAIClient, OpenAIUnavailable
+
+    client = OpenAIClient(settings)
+    if not client.available:
+        raise HTTPException(503, "Не налаштовано OPENAI_API_KEY — голосове введення вимкнено.")
+
+    limit = settings.max_audio_mb * 1024 * 1024
+    declared = None
+    if hasattr(file, "size") and file.size:
+        declared = file.size
+    if declared and declared > limit:
+        raise HTTPException(413, f"Запис довший за {settings.max_audio_mb} МБ.")
+
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(400, "Порожній аудіозапис.")
+    if len(audio) > limit:
+        raise HTTPException(413, f"Запис довший за {settings.max_audio_mb} МБ.")
+
+    try:
+        text = client.transcribe(audio, filename=file.filename or "clarification.webm")
+    except OpenAIUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    return {"text": text, "chars": len(text)}
+
+
+@router.post("/projects/{project_id}/issues/{issue_id}/resolve")
+def resolve_issue(
+    project_id: int,
+    issue_id: int,
+    payload: IssueResolve,
+    session: Session = Depends(get_session),
+):
+    """Apply a written or dictated clarification, then rebuild the estimate.
+
+    ``issue_id`` is the conflict's position in the analysis: conflicts are a
+    JSON list on the object analysis, not rows, so they have no id of their own.
+    """
+    from ..services.ai.openai_speech import OpenAIClient, OpenAIUnavailable
+    from ..services.resolution import ConflictNotFound, resolve_conflict
+
+    project = _project(session, project_id)
+    comment = payload.comment.strip()
+    if not comment:
+        raise HTTPException(400, "Порожнє уточнення — нема чого застосовувати.")
+
+    client = OpenAIClient(settings)
+    if not client.available:
+        raise HTTPException(503, "Не налаштовано OPENAI_API_KEY — розбір уточнень вимкнено.")
+
+    try:
+        return resolve_conflict(
+            session, project, issue_id, comment, client=client, rebuild=payload.recalculate
+        )
+    except ConflictNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except OpenAIUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 # --- jobs --------------------------------------------------------------------

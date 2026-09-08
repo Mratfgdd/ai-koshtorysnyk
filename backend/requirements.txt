@@ -18,6 +18,11 @@ python-multipart==0.0.20
 # An unbounded `>=0.42.0` let the deploy pull 1.3.0 while tests ran on 1.2.0.
 anthropic>=1.2.0,<2.0.0
 
+# Voice input and clarification parsing only; document understanding stays on
+# anthropic. Major-pinned: the 3.x client keeps `audio.transcriptions.create`
+# and `chat.completions.parse`, which is what this code uses.
+openai>=3.7.0,<4.0.0
+
 pymupdf==1.28.2
 openpyxl==3.1.5
 Pillow==12.2.0

@@ -369,3 +369,54 @@ tr.flag-WARNING, tr.flag-NEEDS_USER_INPUT { background: var(--warn-soft); }
   .nav-group { display: none; }
   .main { padding: 18px; }
 }
+
+/* --- microphone in the clarification box ---------------------------------- */
+
+/* The textarea and its icon share a positioning context; the textarea keeps
+   room on the right so a long clarification never runs under the button. */
+.mic-field { position: relative; }
+.mic-field textarea { padding-right: 46px; }
+
+.mic-btn {
+  position: absolute; top: 8px; right: 8px;
+  width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid transparent; border-radius: 8px;
+  background: transparent; color: var(--ink-3);
+  cursor: pointer; transition: background 120ms, color 120ms, border-color 120ms;
+}
+.mic-btn:hover:not(:disabled) {
+  background: var(--accent-soft); color: var(--accent); border-color: var(--accent-soft);
+}
+.mic-btn:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 1px; }
+.mic-btn:disabled { opacity: 0.45; cursor: default; }
+.mic-btn svg { width: 17px; height: 17px; display: block; }
+
+/* Recording: red, and a ring that pulses so it is obvious the mic is live
+   even when the tab is glanced at rather than read. */
+.mic-btn.recording {
+  color: var(--error); background: var(--error-soft); border-color: #f0cfcc;
+}
+.mic-btn.recording::after {
+  content: ""; position: absolute; inset: -2px;
+  border-radius: 10px; border: 2px solid var(--error);
+  animation: mic-pulse 1.4s ease-out infinite;
+}
+@keyframes mic-pulse {
+  0%   { opacity: 0.85; transform: scale(0.92); }
+  70%  { opacity: 0;    transform: scale(1.18); }
+  100% { opacity: 0;    transform: scale(1.18); }
+}
+
+/* Transcribing: the icon spins down to a quiet pulse instead of a spinner,
+   so the row does not reflow while the text is on its way back. */
+.mic-btn.thinking { color: var(--accent); }
+.mic-btn.thinking svg { animation: mic-fade 1s ease-in-out infinite; }
+@keyframes mic-fade {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mic-btn.recording::after, .mic-btn.thinking svg { animation: none; }
+}

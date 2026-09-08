@@ -1,0 +1,12 @@
+[Unit]
+Description=Check once a minute that nginx still owns port 80
+
+[Timer]
+# Webuzo's own service monitor runs every minute; this matches it, so the
+# longest the site can be wrong is about a minute rather than until morning.
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

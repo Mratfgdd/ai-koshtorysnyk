@@ -35,6 +35,28 @@ log = logging.getLogger(__name__)
 
 ProgressFn = Callable[[float, str], None]
 
+# The aggregation prompt carries every page's findings. claude-opus-5 has a 1M
+# context window, so the old 180 000-character cap left the window mostly unused
+# while quietly dropping pages off the end of a large drawing set. 900 000
+# characters is roughly 300K tokens of Cyrillic - comfortably inside the window,
+# and past what any realistic set produces.
+MAX_FINDINGS_CHARS = 900_000
+
+# Added to the aggregation prompt on the second pass, when the first found no
+# page worth aggregating. It lowers the evidence bar without licensing
+# invention: a guessed area must arrive labelled as a guess, so the estimator
+# sees exactly what to check rather than an empty screen.
+LENIENT_PREAMBLE = """
+
+УВАГА: вхідних даних мало — жодна сторінка не дала повного набору показників.
+Це може бути ескіз, концепція або одиничний аркуш. Працюй із тим, що є:
+* сформуй аналіз навіть за фрагментарними даними;
+* кожне неточне значення познач status = "assumption", а не "confirmed";
+* якщо показник вивести неможливо — status = "unknown" і опиши, чого бракує,
+  у полі unknowns; не вигадуй числа;
+* у assumptions поясни, з чого саме зроблено кожне припущення.
+"""
+
 
 @dataclass
 class PageResult:
@@ -51,6 +73,18 @@ class AnalysisOutcome:
     errors: list[str] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
     skipped: list[dict[str, Any]] = field(default_factory=list)
+    # True when the object model came from the lenient second pass rather than
+    # from pages the page-level analysis judged useful. The caller warns the
+    # estimator that the result rests on thin evidence.
+    degraded: bool = False
+
+    @property
+    def pages_with_findings(self) -> list[PageResult]:
+        return [p for p in self.pages if p.findings]
+
+    @property
+    def useful_pages(self) -> list[PageResult]:
+        return [p for p in self.pages if p.findings and p.findings.is_useful]
 
 
 class DocumentAnalyzer:
@@ -102,7 +136,7 @@ class DocumentAnalyzer:
                 schema_model=PageFindings,
                 system=PAGE_ANALYSIS_SYSTEM,
                 content=parts,
-                max_tokens=8000,
+                max_tokens=16000,
             )
             return PageResult(page.page_number, findings, used_vision=used_vision)
         except AIUnavailable as exc:
@@ -209,8 +243,10 @@ class DocumentAnalyzer:
             f"Сторінка {r.page_number}: {r.error}" for r in outcome.pages if r.error
         )
 
-        useful = [r for r in outcome.pages if r.findings and r.findings.is_useful]
-        if not useful:
+        useful = outcome.useful_pages
+        fallback = outcome.pages_with_findings
+
+        if not useful and not fallback:
             outcome.errors.append(
                 "Жодна сторінка не дала корисних даних для кошторису."
             )
@@ -220,7 +256,22 @@ class DocumentAnalyzer:
         if on_progress:
             on_progress(0.85, "Формування аналізу об'єкта")
 
-        outcome.analysis = self._aggregate(useful, documents, brief)
+        if useful:
+            outcome.analysis = self._aggregate(useful, documents, brief)
+        else:
+            # Nothing cleared the "useful" bar — a concept sketch, a single
+            # sheet, a scan with little text. Rather than give up, try once
+            # more over everything the pages did yield, telling the model to
+            # work with what there is and mark every gap as an assumption.
+            # A thin object model the estimator can correct beats a dead end.
+            log.info("no useful pages; retrying aggregation in lenient mode")
+            outcome.errors.append(
+                "Жодна сторінка не дала повних даних — аналіз виконано в "
+                "полегшеному режимі за наявними фрагментами."
+            )
+            outcome.degraded = True
+            outcome.analysis = self._aggregate(fallback, documents, brief, lenient=True)
+
         outcome.usage = self.ai.usage.to_dict()
         if on_progress:
             on_progress(1.0, "Аналіз завершено")
@@ -231,6 +282,7 @@ class DocumentAnalyzer:
         pages: list[PageResult],
         documents: Sequence[tuple[ExtractedDocument, str]],
         brief: str,
+        lenient: bool = False,
     ) -> ObjectAnalysisResult | None:
         """Fuse per-page findings into one site model.
 
@@ -258,11 +310,23 @@ class DocumentAnalyzer:
                 }
             )
 
+        findings_json = json.dumps(payload, ensure_ascii=False)
+        if len(findings_json) > MAX_FINDINGS_CHARS:
+            # Say it out loud. Silently dropping the tail means whole pages of
+            # quantities vanish from the estimate with nothing in the log.
+            log.warning(
+                "page findings are %d characters, over the %d cap - input will "
+                "be cut before aggregation (%d pages carried findings)",
+                len(findings_json), MAX_FINDINGS_CHARS, len(payload),
+            )
+            findings_json = findings_json[:MAX_FINDINGS_CHARS]
+
         shared = (
             "Файли: " + ", ".join(sorted(set(names.values())))
             + (f"\n\nТехнічне завдання від замовника:\n{brief}" if brief.strip() else "")
+            + (LENIENT_PREAMBLE if lenient else "")
             + "\n\nРезультати посторінкового аналізу:\n"
-            + json.dumps(payload, ensure_ascii=False)[:180000]
+            + findings_json
         )
 
         def call(model: type, task: str, max_tokens: int):
@@ -280,7 +344,7 @@ class DocumentAnalyzer:
                 "(площі, довжини, кількості), потрібні секції кошторису та зони. "
                 "Показник, що трапляється на кількох сторінках з різними значеннями, "
                 "познач як status = needs_user_input.",
-                12000,
+                32000,
             )
             schedules = call(
                 ScheduleModel,
@@ -288,13 +352,13 @@ class DocumentAnalyzer:
                 "елементів покриття. Об'єднай дублікати однієї позиції й підсумуй "
                 "кількості з дендроплану. Позиції з приміткою «існуючі» залиши у списку, "
                 "але з is_existing = true.",
-                12000,
+                32000,
             )
             review = call(
                 ReviewModel,
                 "ЗАВДАННЯ ЦЬОГО КРОКУ: перелічи припущення, невідоме, ризики, конфлікти "
                 "даних і питання користувачу. Не більше 8 питань, згрупованих за темою.",
-                10000,
+                24000,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("aggregation failed")
