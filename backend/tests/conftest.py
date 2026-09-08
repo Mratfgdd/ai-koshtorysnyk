@@ -11,6 +11,8 @@ import pytest
 # Point REFERENCE_ROOT at the folder holding the project sub-folders to run the
 # checks that need them; without it those tests skip rather than fail.
 DEFAULT_REFERENCE_ROOTS = (
+    # Where a deployment keeps them — see docs/VPS.md.
+    Path("/var/lib/estimator/references"),
     Path("D:/Chrome download"),
     Path.home() / "Downloads",
 )
