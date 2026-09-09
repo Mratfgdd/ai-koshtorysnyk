@@ -35,6 +35,53 @@ SPEC_RE = re.compile(
 
 STOPWORDS = {"для", "та", "і", "в", "з", "на", "під", "до", "по", "від", "мм", "см"}
 
+# A manufacturer's article number: "Ideal Lux 306872", "EGLO 79024". Five digits
+# is where this stops being ambiguous and the catalogue says so — of the codes
+# it carries, all thirteen with five or more digits are unique to one article,
+# while every four-digit one (1000, 1200, 1500, 2000, 3000) is a length, a
+# volume or a nozzle range shared by several. So four digits is a dimension and
+# five is an identity.
+# Only a digit or a dimension separator disqualifies a neighbour: a comma or a
+# hyphen is punctuation, and requiring clear space either side missed both
+# "NOWODVORSKI 30865," and "IDEAL LUX 81069-".
+SKU_RE = re.compile(r"(?<![\dxX×хХ])\d{5,}(?![\dxX×хХ])")
+
+# A model designation: "Plurijet 4/100", "X-CORE-401-E", "MP1000". Either it
+# begins with a letter, or it is digits joined by a slash. Digits joined by a
+# hyphen are excluded on purpose — "фракція 0-5", "щебінь 20-40" are size
+# ranges, and treating one as an identity would price gravel as a pipe.
+MODEL_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)+|[A-Za-z]{1,6}\d{2,}|\d+/\d+"
+)
+
+# Sales notes the price base carries inside the article name. They say nothing
+# about which product it is and they wreck a name comparison: the catalogue
+# writes "Світильник вуличний бра IDEAL LUX 81069- 15% знижки від вартсоті
+# світильника" where a drawing writes "Світильник фасадний Ф-1, IDEAL LUX 81069".
+MARKETING_RE = re.compile(
+    r"\s*[-—]?\s*\d+\s*%\s*знижк\w*.*$|\s*[-—]\s*акці\w*.*$", re.IGNORECASE
+)
+
+
+def strip_marketing(name: str) -> str:
+    """Drop a discount note from an article name."""
+    return MARKETING_RE.sub("", name or "").strip(" -—,")
+
+
+def sku_codes(name: str) -> set[str]:
+    """Manufacturer article numbers written in a name."""
+    return set(SKU_RE.findall(name or ""))
+
+
+def model_codes(name: str) -> set[str]:
+    """Model designations written in a name, lower-cased."""
+    found = set()
+    for token in MODEL_RE.findall(name or ""):
+        low = token.lower().strip("-/")
+        if any(c.isdigit() for c in low) and len(low) >= 3:
+            found.add(low)
+    return found
+
 
 @dataclass
 class Candidate:
@@ -126,6 +173,8 @@ class CatalogSearch:
         self.session = session
         self._items: list[CatalogItem] | None = None
         self._by_norm: dict[str, CatalogItem] = {}
+        self._by_sku: dict[str, list[CatalogItem]] = {}
+        self._by_model: dict[str, list[CatalogItem]] = {}
 
     # -- data -----------------------------------------------------------------
     @property
@@ -137,7 +186,43 @@ class CatalogSearch:
             # First occurrence wins, matching the workbook's VLOOKUP semantics.
             for it in self._items:
                 self._by_norm.setdefault(it.name_norm, it)
+                self._by_norm.setdefault(normalize_name(strip_marketing(it.name)), it)
+                for code in sku_codes(it.name):
+                    self._by_sku.setdefault(code, []).append(it)
+                for code in model_codes(it.name):
+                    self._by_model.setdefault(code, []).append(it)
         return self._items
+
+    def by_article_number(self, query: str) -> CatalogItem | None:
+        """The one article whose manufacturer's number the query also carries.
+
+        ``None`` when the query names no such number, when the catalogue carries
+        none of them, or when more than one article does — a code shared by two
+        products identifies neither, and that is a question, not a match.
+        """
+        self.items  # ensure loaded
+        for code in sku_codes(query):
+            hits = self._by_sku.get(code, [])
+            if len(hits) == 1:
+                return hits[0]
+        return None
+
+    def by_model(self, query: str) -> CatalogItem | None:
+        """The one article sharing a model designation with the query.
+
+        "Насосна станція Pedrollo Plurijet 4/100" and "Насос Pedrollo Plurijet
+        4/100 (100л/хв)" agree on 4/100, and the 4/200 in the next row of the
+        catalogue is a different pump at two and a half times the price. Where
+        two articles share the designation this returns nothing: "X-CORE-401-E"
+        against an X-CORE in eight zones and an X2 in four is a real choice
+        between two products and belongs to the estimator.
+        """
+        self.items
+        for code in model_codes(query):
+            hits = self._by_model.get(code, [])
+            if len(hits) == 1:
+                return hits[0]
+        return None
 
     def get_exact(self, name: str) -> CatalogItem | None:
         self.items  # ensure loaded
@@ -199,9 +284,12 @@ class CatalogSearch:
         # ranks poorly: "Плити ходові бетонні" sits outside the fuzzy top-25
         # yet is an exact stem match for "Плита ходова бетонна 120х40х6см".
         # The catalog is ~850 rows, so scoring all of it costs nothing.
+        # Compared without the discount notes: "- 15% знижки від вартсоті
+        # світильника" is eleven tokens of sales copy on the end of an article
+        # name, and token_set_ratio counts every one of them against the match.
         scored = process.extract(
             qnorm,
-            {i.id: i.name_norm for i in pool},
+            {i.id: normalize_name(strip_marketing(i.name)) for i in pool},
             scorer=fuzz.token_set_ratio,
             limit=None,
         )
@@ -268,6 +356,13 @@ class CatalogSearch:
 
         Thresholds are conservative on purpose: an "almost right" article at the
         wrong diameter is worse than an explicit question.
+
+        A manufacturer's article number outranks all of it. A drawing writes
+        "Прожектор Пр-2, NOWODVORSKI 30865, 7 Вт" and the catalogue writes
+        "Світильник вуличний прожектор NOWODVORSKI 30865- 15% знижки від
+        вартсоті світильника": as prose they share almost nothing and the fuzzy
+        score put the right article at 46 out of 100, below three unrelated
+        rows. As identities they are the same object and 30865 says so.
         """
         exact = self.get_exact(query)
         if exact is not None:
@@ -278,6 +373,23 @@ class CatalogSearch:
                 candidates=[cand],
                 confidence="high",
                 reason="Назва повністю збігається з позицією у базі (як VLOOKUP у шаблоні).",
+            )
+
+        for finder, label, why in (
+            (self.by_article_number, "артикул виробника",
+             "Збіг за артикулом виробника — це та сама позиція, як би не"
+             " відрізнялися назви."),
+            (self.by_model, "модель",
+             "Збіг за позначенням моделі, унікальним у каталозі."),
+        ):
+            item = finder(query)
+            if item is None:
+                continue
+            cand = Candidate(item=item, score=100.0,
+                             reasons=[f"{label}: {item.name}"])
+            return MatchResult(
+                status="matched", best=cand, candidates=[cand],
+                confidence="high", reason=why,
             )
 
         candidates = self.search(query, kind=kind, category=category, unit=unit)
