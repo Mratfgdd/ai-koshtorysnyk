@@ -71,6 +71,12 @@ def main() -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--only", default="",
                         help="restrict to proposals whose name contains this")
+    parser.add_argument("--exclude", default="",
+                        help="skip proposals whose name contains this — use it to "
+                             "keep an object's own КП out when the catalogue is "
+                             "about to be measured against it")
+    parser.add_argument("--name", default="",
+                        help="add only articles whose name contains this")
     parser.add_argument("--apply", action="store_true", help="write to the catalogue")
     parser.add_argument("--show", type=int, default=40)
     args = parser.parse_args()
@@ -78,6 +84,8 @@ def main() -> int:
     paths = reference_proposals(args.root)
     if args.only:
         paths = [p for p in paths if args.only.lower() in p.name.lower()]
+    if args.exclude:
+        paths = [p for p in paths if args.exclude.lower() not in p.name.lower()]
     if not paths:
         print(f"No proposals under {args.root}"
               + (f" matching «{args.only}»" if args.only else ""))
@@ -108,6 +116,8 @@ def main() -> int:
             last = prices.exact(key)
             if last is None or last.unit_price <= 0 or not last.unit:
                 continue
+            if args.name and args.name.lower() not in last.name.lower():
+                continue
             additions.append(last)
 
         additions.sort(key=lambda p: -p.unit_price)
@@ -121,7 +131,7 @@ def main() -> int:
         if len(additions) > args.show:
             print(f"… ще {len(additions) - args.show}")
 
-        kinds = Counter(classify_kind(a.name, a.unit, "") for a in additions)
+        kinds = Counter(kind_of(a) for a in additions)
         print(f"\nby kind: {dict(kinds)}")
 
         if not args.apply:
@@ -140,7 +150,7 @@ def main() -> int:
                     # Left at zero on purpose: a guessed cost would make the
                     # margin report lie.
                     unit_cost=0.0,
-                    kind=classify_kind(last.name, last.unit, ""),
+                    kind=kind_of(last),
                     price_updated_at=None,
                     attributes={},
                     source_file=f"{SOURCE_PREFIX}{last.project}",

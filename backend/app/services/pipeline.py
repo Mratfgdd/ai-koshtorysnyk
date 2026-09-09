@@ -455,6 +455,14 @@ def plan_and_build(
     notes: list[str] = []
 
     if analysis is not None:
+        # Re-reading the drawings makes a new version of the analysis, and the
+        # figures the estimator supplied were written onto the old one. Without
+        # this, re-analysing a project silently throws away every quantity that
+        # had been answered: on Майорівка the paving area went back to unknown
+        # and the section from 98 653 to 1 325.
+        replayed = _replay_quantity_answers(session, project, analysis)
+        if replayed:
+            notes.append(f"Відновлено відповіді про обсяги: {replayed}.")
         derived = _from_analysis(analysis, layout, session)
         sections = sections or derived["sections"]
         for key, values in derived["quantities"].items():
@@ -903,6 +911,34 @@ def _section_of_article(
 QUANTITY_PREFIX = "qty:"
 
 
+def _replay_quantity_answers(
+    session: Session, project: Project, analysis: ObjectAnalysis
+) -> int:
+    """Put the estimator's figures back onto the analysis they belong to.
+
+    A quantity answer is a statement about the drawing, so it outlives any one
+    reading of it. Re-analysing produces a fresh :class:`ObjectAnalysis` that
+    knows nothing of what was answered against the last one; replaying them here
+    means a re-read adds what the model now sees without losing what a person
+    already said. An answer whose subject the new reading does not contain is
+    left alone rather than forced back in.
+    """
+    answered = session.scalars(
+        select(Question).where(
+            Question.project_id == project.id,
+            Question.status == "answered",
+            Question.answer.is_not(None),
+        )
+    ).all()
+    replayed = 0
+    for question in answered:
+        if not question.code.startswith(QUANTITY_PREFIX):
+            continue
+        if _apply_quantity(session, project.id, question, analysis=analysis):
+            replayed += 1
+    return replayed
+
+
 def _quantity_targets(
     analysis: ObjectAnalysis, billing_units: set[str] | None = None
 ) -> list[dict[str, Any]]:
@@ -1334,7 +1370,12 @@ def _chosen_article(session: Session, answer: str):
     return InvoicedPrices.from_db(session).exact(name)
 
 
-def _apply_quantity(session: Session, project_id: int, question: Question) -> bool:
+def _apply_quantity(
+    session: Session,
+    project_id: int,
+    question: Question,
+    analysis: ObjectAnalysis | None = None,
+) -> bool:
     """Write an answered quantity back onto the object analysis.
 
     Onto the analysis, not onto the estimate line, because a quantity is not a
@@ -1353,12 +1394,13 @@ def _apply_quantity(session: Session, project_id: int, question: Question) -> bo
     if not target:
         return False
 
-    analysis = session.scalars(
-        select(ObjectAnalysis)
-        .where(ObjectAnalysis.project_id == project_id)
-        .order_by(ObjectAnalysis.version.desc())
-        .limit(1)
-    ).first()
+    if analysis is None:
+        analysis = session.scalars(
+            select(ObjectAnalysis)
+            .where(ObjectAnalysis.project_id == project_id)
+            .order_by(ObjectAnalysis.version.desc())
+            .limit(1)
+        ).first()
     if analysis is None:
         return False
 
