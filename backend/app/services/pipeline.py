@@ -1076,7 +1076,54 @@ def _carry_over_answers(session: Session, project: Project, estimate: Estimate) 
         applied += 1
     if applied:
         session.commit()
+        _ask_about_unpriced_lines(session, project, estimate)
     return applied
+
+
+def _ask_about_unpriced_lines(
+    session: Session, project: Project, estimate: Estimate
+) -> None:
+    """Ask again for anything the replayed answers left without a price.
+
+    An answer can rename the line it lands on: choosing "Ялина оморіка 2м" as
+    the substitute for "Ялина корейська" gives the estimate an article the price
+    base does not price. The question that was asked under the old name is
+    answered and closed, and without this nothing would ever ask under the new
+    one -- the proposal stays unexportable with no way for the estimator to see
+    why from the questions list.
+    """
+    existing = {
+        q.code
+        for q in session.scalars(
+            select(Question).where(Question.project_id == project.id)
+        ).all()
+    }
+    added = False
+    for line in estimate.lines:
+        if line.quantity <= 0 or line.unit_price > 0 or line.block == "driver":
+            continue
+        code = f"price:{normalize_name(line.name)[:90]}"
+        if code in existing:
+            continue
+        session.add(
+            Question(
+                project_id=project.id,
+                estimate_id=estimate.id,
+                group="Ціни рослин" if line.block == "plants" else "Ціни позицій",
+                code=code,
+                text=f"Яка ціна за 1 {line.unit or 'шт'} для «{line.name}»?",
+                why=(
+                    "Позиція з'явилася після вашої відповіді й не має ціни "
+                    "ні в базі, ні в історії виданих КП."
+                ),
+                kind="number",
+                affects=[line.section],
+            )
+        )
+        existing.add(code)
+        added = True
+    if added:
+        session.commit()
 
 
 def _chosen_article(session: Session, answer: str):
