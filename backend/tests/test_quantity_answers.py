@@ -59,15 +59,23 @@ def test_a_confirmed_figure_is_not_asked_about() -> None:
 
 
 def test_a_note_about_the_site_is_not_asked_about() -> None:
-    """The ±0,00 level and the drawing scale carry no unit and are not
-    quantities; asking for their number would be noise."""
+    """Neither the drawing scale nor the ±0,00 level is a quantity. The scale
+    carries no unit at all; the level carries "м", which the company does not
+    bill in — its rows are м.п, м² and м³."""
     a = analysis(facts=[
         {"label": "Масштаб основних креслень", "value": "1:130", "unit": "",
          "status": "confirmed"},
-        {"label": "Адреса об'єкта", "value": "Львівська обл.", "unit": "",
-         "status": "confirmed"},
+        {"label": "Рівень ±0,00", "value": "367,30", "unit": "м",
+         "status": "confirmed", "section": "prep"},
     ])
-    assert _quantity_targets(a) == []
+    billing = {"шт", "м²", "мп", "м³", "кг", "послуга"}
+    assert _quantity_targets(a, billing) == []
+
+
+def test_a_real_unit_still_gets_its_question() -> None:
+    a = analysis(facts=[{"label": "Бруківка (площа)", "value": "", "unit": "м²",
+                         "status": "needs_user_input", "section": "paving"}])
+    assert len(_quantity_targets(a, {"шт", "м²", "мп"})) == 1
 
 
 def test_a_component_without_a_quantity_is_asked_about() -> None:

@@ -903,24 +903,31 @@ def _section_of_article(
 QUANTITY_PREFIX = "qty:"
 
 
-def _quantity_targets(analysis: ObjectAnalysis) -> list[dict[str, Any]]:
+def _quantity_targets(
+    analysis: ObjectAnalysis, billing_units: set[str] | None = None
+) -> list[dict[str, Any]]:
     """Everything the analysis named but could not put a number on.
 
     Three shapes, and each needs its own code so an answer knows where to go:
     a fact whose figure is missing or held back for review, a component listed
     without a quantity, and a plant on the schedule with no count.
 
-    Only the ones that would become money are asked about. A fact with no unit,
-    or with a unit this company does not bill in, is a note about the site —
-    the ±0,00 level, the drawing scale — and asking its quantity would be
-    noise.
+    Only the ones that would become money are asked about. A figure whose unit
+    this company does not bill in is a note about the site, not a quantity: the
+    ±0,00 level reads "367,30 м" and the drawing scale "1:130", and asking an
+    estimator how many of those there are is noise. The billing units come from
+    the catalogue's own rows, so the test moves with the client's data.
     """
+    units = billing_units if billing_units is not None else set()
     out: list[dict[str, Any]] = []
+
+    def billable(unit: str) -> bool:
+        return bool(unit) and (not units or normalize_unit(unit) in units)
 
     for fact in analysis.facts or []:
         label = str(fact.get("label", "")).strip()
         unit = str(fact.get("unit", "")).strip()
-        if not label or not unit:
+        if not label or not billable(unit):
             continue
         held = fact.get("status") in FACT_STATUSES_OUT_OF_ESTIMATE
         if _as_float(fact.get("value")) is not None and not held:
@@ -971,8 +978,10 @@ def _questions_from_missing_quantities(
             select(Question).where(Question.project_id == project.id)
         ).all()
     }
+    search = CatalogSearch(session)
+    billing_units = {normalize_unit(i.unit) for i in search.items if i.unit}
     added = 0
-    for target in _quantity_targets(analysis):
+    for target in _quantity_targets(analysis, billing_units):
         code = f"{QUANTITY_PREFIX}{target['kind']}:{normalize_name(target['name'])[:80]}"
         if code in existing:
             continue
