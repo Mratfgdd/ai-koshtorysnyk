@@ -795,7 +795,7 @@ def _resolve_coverage_target(
     if match.status == "matched" and match.best is not None:
         candidate = match.best.item
         home = _section_of_article(candidate.name, layout)
-        if home is None:
+        if home is None and section not in layout.sections:
             return (
                 None,
                 "",
@@ -811,6 +811,14 @@ def _resolve_coverage_target(
                     "система його не вигадує"
                 ),
             )
+        if home is None:
+            # The catalogue prices it and the drawing says which section it
+            # belongs to, but the workbook has no row for it — every article
+            # added from an issued proposal is in this position, and every
+            # light fitting on this project was one. Refusing left the section
+            # empty over an article whose price was in hand; it is added to the
+            # section the drawing put it in, as a line of its own.
+            return candidate.name, "позиція каталогу (додано до секції)", ""
         kind = "позиція каталогу"
         if home != section:
             kind = f"позиція каталогу, секція «{layout.title(home)}»"
