@@ -84,14 +84,8 @@ class _Item:
 def _search_over(names):
     from app.services.catalog.search import CatalogSearch
 
-    search = CatalogSearch.__new__(CatalogSearch)
-    search.session = None
-    search._items = [_Item(n) for n in names]
-    search._by_norm = {}
-    search._by_sku = {}
-    search._by_model = {}
-    for item in search._items:
-        search._by_norm.setdefault(item.name_norm, item)
+    search = CatalogSearch(session=None)
+    search.index([_Item(n) for n in names])
     return search
 
 

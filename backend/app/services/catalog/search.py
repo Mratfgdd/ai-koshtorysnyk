@@ -223,22 +223,35 @@ class CatalogSearch:
         self._by_norm: dict[str, CatalogItem] = {}
         self._by_sku: dict[str, list[CatalogItem]] = {}
         self._by_model: dict[str, list[CatalogItem]] = {}
+        self._by_dimension: dict[str, list[CatalogItem]] = {}
 
     # -- data -----------------------------------------------------------------
+    def index(self, items: list[CatalogItem]) -> None:
+        """Build the lookups the matcher reads: by name, number, model, size."""
+        self._items = items
+        self._by_norm.clear()
+        self._by_sku.clear()
+        self._by_model.clear()
+        self._by_dimension.clear()
+        for it in items:
+            # First occurrence wins, matching the workbook's VLOOKUP semantics.
+            self._by_norm.setdefault(it.name_norm, it)
+            self._by_norm.setdefault(normalize_name(strip_marketing(it.name)), it)
+            for code in sku_codes(it.name):
+                self._by_sku.setdefault(code, []).append(it)
+            for code in model_codes(it.name):
+                self._by_model.setdefault(code, []).append(it)
+            for form in dimension_forms(it.name):
+                self._by_dimension.setdefault(form, []).append(it)
+
     @property
     def items(self) -> list[CatalogItem]:
         if self._items is None:
-            self._items = list(
-                self.session.scalars(select(CatalogItem).where(CatalogItem.active.is_(True))).all()
-            )
-            # First occurrence wins, matching the workbook's VLOOKUP semantics.
-            for it in self._items:
-                self._by_norm.setdefault(it.name_norm, it)
-                self._by_norm.setdefault(normalize_name(strip_marketing(it.name)), it)
-                for code in sku_codes(it.name):
-                    self._by_sku.setdefault(code, []).append(it)
-                for code in model_codes(it.name):
-                    self._by_model.setdefault(code, []).append(it)
+            self.index(list(
+                self.session.scalars(
+                    select(CatalogItem).where(CatalogItem.active.is_(True))
+                ).all()
+            ))
         return self._items
 
     def by_article_number(self, query: str) -> CatalogItem | None:
@@ -253,6 +266,30 @@ class CatalogSearch:
             hits = self._by_sku.get(code, [])
             if len(hits) == 1:
                 return hits[0]
+        return None
+
+    def by_dimensions(self, query: str) -> CatalogItem | None:
+        """The one article of its kind carrying the size the query gives.
+
+        A size identifies a product about as well as an article number does,
+        once it is read in the same units: "Плити 1200х400" and "Плита ходова
+        бетонна 120х40х6см" are one slab, and nothing else in the catalogue is
+        1200 by 400. As prose they score 49 out of 100 and lose to "Підготовка
+        подушки під плити", which shares the word and none of the object.
+
+        Two conditions, and both are needed. The size must belong to exactly
+        one article, and the two names must agree on at least one word that is
+        not the size — otherwise a 1200x400 slab would answer for a 1200x400
+        sheet of anything else that happened to be alone at that size.
+        """
+        self.items
+        for form in dimension_forms(query):
+            hits = self._by_dimension.get(form, [])
+            if len(hits) != 1:
+                continue
+            item = hits[0]
+            if stems(query) & stems(item.name):
+                return item
         return None
 
     def by_model(self, query: str) -> CatalogItem | None:
@@ -431,6 +468,8 @@ class CatalogSearch:
              " відрізнялися назви."),
             (self.by_model, "модель",
              "Збіг за позначенням моделі, унікальним у каталозі."),
+            (self.by_dimensions, "габарити",
+             "Збіг за габаритами, унікальними в каталозі, і спільним словом у назві."),
         ):
             item = finder(query)
             if item is None:
