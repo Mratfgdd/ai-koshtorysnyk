@@ -158,12 +158,18 @@ def test_render_free_tier_declares_no_disk() -> None:
         assert service["disk"]["mountPath"] == env["DATA_DIR"]
 
 
-def test_storage_paths_follow_data_dir(tmp_path: Path) -> None:
+def test_storage_paths_follow_data_dir(tmp_path: Path, monkeypatch) -> None:
     """DATA_DIR must move uploads and the cache with it.
 
     Otherwise pointing it at /tmp or a disk leaves PDFs and rendered pages
     behind in the source tree, where the deploy cannot rely on them.
     """
+    # This is about the derivation, so the ambient environment must not answer
+    # for it -- conftest sets these three to keep the suite out of a live
+    # deployment's upload tree, and they would satisfy the assertions falsely.
+    for name in ("UPLOAD_DIR", "CACHE_DIR", "PAGE_IMAGE_DIR"):
+        monkeypatch.delenv(name, raising=False)
+
     s = Settings(data_dir=tmp_path)
     assert s.upload_dir == tmp_path / "uploads"
     assert s.cache_dir == tmp_path / "cache"

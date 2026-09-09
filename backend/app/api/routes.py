@@ -11,6 +11,7 @@ import datetime as dt
 import errno
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -312,6 +313,19 @@ def update_project(project_id: int, payload: ProjectUpdate, session: Session = D
 def delete_project(project_id: int, session: Session = Depends(get_session)) -> Response:
     session.delete(_project(session, project_id))
     session.commit()
+    # The row goes and its uploads used to stay. Project ids are handed out in
+    # sequence, so the next project to be given this number inherited a
+    # directory it did not create -- and if that directory had been made by a
+    # different user, every upload to it failed with "Permission denied" on the
+    # first byte. Best effort: a directory that cannot be removed is not a
+    # reason to fail a delete that has already happened.
+    directory = settings.upload_dir / str(project_id)
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("could not remove %s after deleting the project: %s", directory, exc)
     return Response(status_code=204)
 
 
