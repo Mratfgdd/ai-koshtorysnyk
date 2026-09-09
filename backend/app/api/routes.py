@@ -911,19 +911,30 @@ def answer_question(
     question.answered_at = dt.datetime.now(dt.timezone.utc)
     session.commit()
 
-    if question.estimate_id:
-        estimate = session.get(Estimate, question.estimate_id)
-        if estimate is not None:
-            from ..services.pipeline import apply_answer, plan_and_build
+    # A question about a quantity belongs to the project, not to one estimate:
+    # it asks what the drawing says, and the answer outlives every version built
+    # from it. Requiring an estimate_id here meant those answers were stored and
+    # never applied — the figure went in and nothing moved.
+    estimate = session.get(Estimate, question.estimate_id) if question.estimate_id else None
+    if estimate is None:
+        estimate = session.scalars(
+            select(Estimate)
+            .where(Estimate.project_id == question.project_id)
+            .order_by(Estimate.version.desc())
+            .limit(1)
+        ).first()
+    if estimate is None:
+        return {"status": "answered"}
 
-            # A quantity answer changes what the drawing is taken to say, so the
-            # estimate is built again from the analysis and every formula that
-            # reads that figure runs. A price or a catalogue choice only moves
-            # one line, and recalculating is enough.
-            if apply_answer(session, estimate, question):
-                return plan_and_build(session, estimate.project, EstimateCreate())
-            return recalculate_estimate(session, estimate)
-    return {"status": "answered"}
+    from ..services.pipeline import apply_answer, plan_and_build
+
+    # A quantity answer changes what the drawing is taken to say, so the
+    # estimate is built again from the analysis and every formula that reads
+    # that figure runs. A price or a catalogue choice only moves one line, and
+    # recalculating is enough.
+    if apply_answer(session, estimate, question):
+        return plan_and_build(session, estimate.project, EstimateCreate())
+    return recalculate_estimate(session, estimate)
 
 
 # --- catalog -----------------------------------------------------------------
