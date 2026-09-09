@@ -145,9 +145,16 @@ def test_two_rows_must_agree_on_what_is_measured(driver, name, agree) -> None:
 
 
 def test_a_figure_that_cannot_be_placed_is_reported(layout, search) -> None:
-    """A fixture the client's base does not carry must come back with a reason,
-    never as a silent None-and-shrug."""
-    target, _kind, reason = resolve("Гірлянда Г-1, GOLDLUX 32652, 60 Вт", "шт",
-                                    "lighting", layout, search)
+    """Something the base does not carry must come back with a reason, never as
+    a silent None-and-shrug.
+
+    The subject is deliberately invented rather than borrowed from a real
+    project: this once used GOLDLUX 32652, which the catalogue has since been
+    given, so the test started failing for the reason the work succeeded.
+    """
+    target, _kind, reason = resolve(
+        "Ліхтар підвісний QWXZ-0000 (вигадана позиція)", "шт", "lighting",
+        layout, search,
+    )
     assert target is None
     assert reason, "a refusal without a reason is a silent drop"
