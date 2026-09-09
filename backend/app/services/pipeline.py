@@ -464,6 +464,7 @@ def plan_and_build(
         plants = plants or derived["plants"]
         notes.extend(derived["notes"])
         _questions_from_coverage(session, project, derived.get("unresolved", []))
+        _questions_from_missing_quantities(session, project, analysis)
 
     if not sections:
         _finish(session, job, "error", {}, "Не визначено жодної секції кошторису.")
@@ -899,6 +900,105 @@ def _section_of_article(
     return None
 
 
+QUANTITY_PREFIX = "qty:"
+
+
+def _quantity_targets(analysis: ObjectAnalysis) -> list[dict[str, Any]]:
+    """Everything the analysis named but could not put a number on.
+
+    Three shapes, and each needs its own code so an answer knows where to go:
+    a fact whose figure is missing or held back for review, a component listed
+    without a quantity, and a plant on the schedule with no count.
+
+    Only the ones that would become money are asked about. A fact with no unit,
+    or with a unit this company does not bill in, is a note about the site —
+    the ±0,00 level, the drawing scale — and asking its quantity would be
+    noise.
+    """
+    out: list[dict[str, Any]] = []
+
+    for fact in analysis.facts or []:
+        label = str(fact.get("label", "")).strip()
+        unit = str(fact.get("unit", "")).strip()
+        if not label or not unit:
+            continue
+        held = fact.get("status") in FACT_STATUSES_OUT_OF_ESTIMATE
+        if _as_float(fact.get("value")) is not None and not held:
+            continue
+        out.append({
+            "kind": "fact", "name": label, "unit": unit,
+            "section": fact.get("section"),
+            "seen": str(fact.get("value") or "").strip(),
+            "why": ("Показник прочитано, але він потребує підтвердження."
+                    if held else "Значення не вказано у відомостях."),
+        })
+
+    for entry in analysis.components or []:
+        name = str(entry.get("name", "")).strip()
+        if not name or entry.get("quantity") is not None:
+            continue
+        out.append({
+            "kind": "component", "name": name,
+            "unit": str(entry.get("unit", "")).strip(),
+            "section": entry.get("section"), "seen": "",
+            "why": "Позиція є у відомості, але без кількості.",
+        })
+
+    for plant in analysis.plants or []:
+        name = str(plant.get("name", "")).strip()
+        if not name or plant.get("quantity") is not None or plant.get("is_existing"):
+            continue
+        out.append({
+            "kind": "plant", "name": name, "unit": "шт", "section": "planting",
+            "seen": "", "why": "Рослина є в асортименті, але без кількості.",
+        })
+
+    return out
+
+
+def _questions_from_missing_quantities(
+    session: Session, project: Project, analysis: ObjectAnalysis
+) -> int:
+    """Ask for the figures, one question per thing that needs one.
+
+    The estimate was asking for these already, in prose the operator could read
+    and nothing could act on: "Вкажіть кількості, відсутні у відомостях". A
+    question with a target and a number for an answer can be applied.
+    """
+    existing = {
+        q.code
+        for q in session.scalars(
+            select(Question).where(Question.project_id == project.id)
+        ).all()
+    }
+    added = 0
+    for target in _quantity_targets(analysis):
+        code = f"{QUANTITY_PREFIX}{target['kind']}:{normalize_name(target['name'])[:80]}"
+        if code in existing:
+            continue
+        unit = target["unit"] or "од."
+        seen = f" Прочитано з креслення: «{target['seen']}»." if target["seen"] else ""
+        session.add(
+            Question(
+                project_id=project.id,
+                group="Незаповнені обсяги",
+                code=code,
+                text=f"Яка кількість для «{target['name']}»? ({unit})",
+                why=target["why"] + seen +
+                    " Число з відповіді підставляється у розрахунок і запускає"
+                    " пов'язані формули шаблону.",
+                kind="number",
+                default_value=target["seen"][:300],
+                affects=[target["section"] or ""],
+            )
+        )
+        existing.add(code)
+        added += 1
+    if added:
+        session.commit()
+    return added
+
+
 def _questions_from_coverage(
     session: Session, project: Project, unresolved: list[dict[str, Any]]
 ) -> None:
@@ -1225,11 +1325,87 @@ def _chosen_article(session: Session, answer: str):
     return InvoicedPrices.from_db(session).exact(name)
 
 
-def apply_answer(session: Session, estimate: Estimate, question: Question) -> None:
-    """Apply one answer to the estimate it affects."""
+def _apply_quantity(session: Session, project_id: int, question: Question) -> bool:
+    """Write an answered quantity back onto the object analysis.
+
+    Onto the analysis, not onto the estimate line, because a quantity is not a
+    number in a cell -- it is what the template's formulas read. The paving area
+    feeds "Загальна площа бруківка", and the bedding, the gravel, the levelling
+    and the laying are all derived from it; writing the figure straight into a
+    line would leave every one of them at zero. Put it where the drawing's own
+    figures live and the whole deterministic chain runs over it.
+
+    Returns whether the estimate has to be rebuilt.
+    """
+    value = _as_float(question.answer)
+    if value is None:
+        return False
+    kind, _, target = question.code[len(QUANTITY_PREFIX):].partition(":")
+    if not target:
+        return False
+
+    analysis = session.scalars(
+        select(ObjectAnalysis)
+        .where(ObjectAnalysis.project_id == project_id)
+        .order_by(ObjectAnalysis.version.desc())
+        .limit(1)
+    ).first()
+    if analysis is None:
+        return False
+
+    def matches(name: Any) -> bool:
+        return normalize_name(str(name or ""))[:80] == target
+
+    changed = False
+    if kind == "fact":
+        facts = list(analysis.facts or [])
+        for fact in facts:
+            if matches(fact.get("label")):
+                fact["value"] = value
+                fact["status"] = "confirmed"
+                fact["confidence"] = "high"
+                fact["source_type"] = "user_input"
+                fact["source_ref"] = "Відповідь кошторисника"
+                changed = True
+        analysis.facts = facts
+    elif kind == "component":
+        components = list(analysis.components or [])
+        for entry in components:
+            if matches(entry.get("name")):
+                entry["quantity"] = value
+                entry["note"] = "Кількість внесено кошторисником"
+                changed = True
+        analysis.components = components
+    elif kind == "plant":
+        plants = list(analysis.plants or [])
+        for plant in plants:
+            if matches(plant.get("name")):
+                plant["quantity"] = value
+                plant["note"] = "Кількість внесено кошторисником"
+                changed = True
+        analysis.plants = plants
+
+    if not changed:
+        return False
+
+    # SQLAlchemy does not see in-place edits to a JSON column.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    for field in ("facts", "components", "plants"):
+        flag_modified(analysis, field)
+    session.commit()
+    return True
+
+
+def apply_answer(session: Session, estimate: Estimate, question: Question) -> bool:
+    """Apply one answer. Returns whether the estimate must be rebuilt from the
+    analysis rather than merely recalculated."""
     answer = (question.answer or "").strip()
     if not answer:
-        return
+        return False
+
+    if question.code.startswith(QUANTITY_PREFIX):
+        return _apply_quantity(session, estimate.project_id, question)
 
     if question.code.startswith("price:"):
         target = question.code[len("price:"):]
@@ -1245,7 +1421,7 @@ def apply_answer(session: Session, estimate: Estimate, question: Question) -> No
             if chosen is not None:
                 price = chosen.unit_price
         if price is None:
-            return
+            return False
         for line in estimate.lines:
             if normalize_name(line.name).startswith(target):
                 line.unit_price = price
@@ -1269,13 +1445,13 @@ def apply_answer(session: Session, estimate: Estimate, question: Question) -> No
                     ]
                 line.confidence = "high"
         session.commit()
-        return
+        return False
 
     if question.code.startswith("match:"):
         target = question.code[len("match:"):]
         item = CatalogSearch(session).get_exact(answer)
         if item is None:
-            return
+            return False
         for line in estimate.lines:
             if normalize_name(line.name).startswith(target):
                 line.catalog_id = item.id
@@ -1290,9 +1466,10 @@ def apply_answer(session: Session, estimate: Estimate, question: Question) -> No
                     "Позицію обрано користувачем у відповідь на питання."
                 ]
         session.commit()
-        return
+        return False
 
     # Anything else is recorded; the operator applies it through the estimate UI.
+    return False
 
 
 def recalculate_estimate(session: Session, estimate: Estimate) -> dict[str, Any]:

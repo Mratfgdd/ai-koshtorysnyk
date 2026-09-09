@@ -914,9 +914,14 @@ def answer_question(
     if question.estimate_id:
         estimate = session.get(Estimate, question.estimate_id)
         if estimate is not None:
-            from ..services.pipeline import apply_answer
+            from ..services.pipeline import apply_answer, plan_and_build
 
-            apply_answer(session, estimate, question)
+            # A quantity answer changes what the drawing is taken to say, so the
+            # estimate is built again from the analysis and every formula that
+            # reads that figure runs. A price or a catalogue choice only moves
+            # one line, and recalculating is enough.
+            if apply_answer(session, estimate, question):
+                return plan_and_build(session, estimate.project, EstimateCreate())
             return recalculate_estimate(session, estimate)
     return {"status": "answered"}
 
