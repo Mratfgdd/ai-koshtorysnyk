@@ -206,6 +206,12 @@ def _columns(band: list[tuple]) -> dict[str, float] | None:
     for w in band:
         x_of.setdefault(w[4], w[0])
     return {
+        # The row-number column, read off the "#" of this table's own header.
+        # It was pinned at x < 36, which is where it sits on most of these
+        # proposals; Катерина's is printed on a wider sheet with "#" at 108, so
+        # every row number was read as the first word of the article and 242 of
+        # its 248 rows came out as "35 Доставка сипучих матеріалів".
+        "index": x_of.get("#", 24.0) + 12,
         "qty": x_of["К-сть"] - 12,
         "unit": x_of.get("Од.", x_of["К-сть"] + 40) - 8,
         "price": x_of["Ціна"] - 14,
@@ -228,7 +234,7 @@ def _cells(band: list[tuple], cols: dict[str, float]) -> dict[str, str]:
             key = "unit"
         elif x >= cols["qty"]:
             key = "qty"
-        elif x < 36 and text.isdigit():
+        elif x < cols["index"] and text.isdigit():
             # The row number. Anything else this far left is a section marker,
             # which belongs to the name so it can be recognised as one.
             key = "index"
@@ -432,10 +438,14 @@ def reference_proposals(root: Path) -> list[Path]:
     exported into the download folder — those sit loose at the top level.
     A folder downloaded twice yields the same proposal twice, so keep one copy
     of each filename.
+
+    The name may separate "КП" from the rest with a space or an underscore —
+    Drive substitutes one for the other on download, and a proposal saved as
+    "КП_2026_2_квартал_…" was silently skipped by a check for "КП ".
     """
     found: dict[str, Path] = {}
     for path in sorted(root.rglob("*.pdf")):
-        if not path.name.startswith("КП ") or "бруківка" in path.name.lower():
+        if not re.match(r"КП[ _]", path.name) or "бруківка" in path.name.lower():
             continue
         if path.parent == root:
             continue

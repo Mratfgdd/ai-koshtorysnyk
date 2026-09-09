@@ -61,11 +61,13 @@ class Sheet:
         self._row([(20, f"Рахунок {title}:")])
 
     def table(self, title: str) -> None:
-        self._row([(X["index"] - 1, "#"), (160, title), *HEADER])
+        self._row([(self.index_x - 1, "#"), (160, title), *HEADER])
+
+    index_x = X["index"]
 
     def line(self, n: int, name: str, qty: float, unit: str, price: float) -> None:
         self._row([
-            (X["index"], str(n)), (X["name"], name),
+            (self.index_x, str(n)), (self.index_x + 15, name),
             (X["qty"], f"{qty:g}"), (X["unit"], unit),
             (X["price"], f"{price:g}"), (X["total"], money(qty * price)),
         ])
@@ -186,6 +188,28 @@ def test_a_cell_with_no_number_reads_as_none(text) -> None:
 
 
 # --- against the real references, when they are on this machine ---------------
+
+
+def test_a_wider_sheet_still_finds_its_row_numbers(tmp_path) -> None:
+    """Катерина's proposal is printed with "#" at x=108, not at 24.
+
+    The row-number column used to be pinned at x < 36, so on that sheet every
+    number was read as the first word of the article and 242 of its 248 rows
+    came out as "35 Доставка сипучих матеріалів". The column is taken from the
+    table's own header now, like every other one.
+    """
+    sheet = Sheet(tmp_path / "wide.pdf")
+    sheet.index_x = 108
+    sheet.section("Водопостачання")
+    sheet.table("Матеріали")
+    sheet.line(1, "Труба поліетиленова, D-32", 17, "м.п", 27)
+    sheet.line(2, "Фітінг коліно UNIDELTA, D-32", 3, "шт", 140)
+    sheet.subtotal("матеріали", 17 * 27 + 3 * 140)
+    proposal = parse_proposal(sheet.save())
+
+    assert proposal.reconciles, proposal.block_deltas()
+    names = [r.name for r in proposal.rows]
+    assert names == ["Труба поліетиленова, D-32", "Фітінг коліно UNIDELTA, D-32"], names
 
 
 def test_every_reference_proposal_reconciles(reference_root) -> None:
