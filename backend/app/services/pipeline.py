@@ -532,6 +532,13 @@ def plan_and_build(
         report=validation,
     )
     _questions_from_build(session, project, estimate, result, layout)
+    carried = _carry_over_answers(session, project, estimate)
+    if carried:
+        notes.append(f"Перенесено відповідей користувача: {carried}.")
+        recalculated = recalculate_estimate(session, estimate)
+        validation_dict = recalculated["validation"]
+    else:
+        validation_dict = validation.to_dict()
 
     _finish(
         session,
@@ -553,7 +560,7 @@ def plan_and_build(
         "job_id": job.id,
         "totals": estimate.totals,
         "sections": group_by_section(estimate.lines),
-        "validation": validation.to_dict(),
+        "validation": validation_dict,
         "unmatched": result.unmatched,
         "ambiguous": result.ambiguous,
         "notes": notes + result.notes,
@@ -1031,6 +1038,45 @@ def _questions_from_build(
 
 
 # --- step 3: answers and recalculation --------------------------------------
+
+
+def _carry_over_answers(session: Session, project: Project, estimate: Estimate) -> int:
+    """Re-apply what the estimator has already decided to a fresh estimate.
+
+    A rebuild starts from the object analysis and prices everything again from
+    the catalogue and the price history, so it knew nothing about answers given
+    to earlier versions. Answer every question on a project, press recalculate,
+    and every price you entered was gone -- the plants went back to 0,00 and the
+    proposal was unexportable again for exactly the reasons you had just cleared.
+
+    Only the two kinds of answer that carry a decision about a line are
+    replayed: a price and a catalogue choice. Everything else is a note for the
+    estimator and is left where it is.
+
+    The answers are also re-pointed at this estimate. They were bound to the one
+    that raised the question, which by now can be several versions old, so
+    answering again would have gone on writing into a superseded draft.
+    """
+    answered = session.scalars(
+        select(Question).where(
+            Question.project_id == project.id,
+            Question.status == "answered",
+            Question.answer.is_not(None),
+        )
+    ).all()
+
+    applied = 0
+    for question in answered:
+        if not question.code.startswith(("price:", "match:")):
+            continue
+        if not (question.answer or "").strip():
+            continue
+        question.estimate_id = estimate.id
+        apply_answer(session, estimate, question)
+        applied += 1
+    if applied:
+        session.commit()
+    return applied
 
 
 def _chosen_article(session: Session, answer: str):
