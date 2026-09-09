@@ -1122,6 +1122,31 @@ def _ask_about_unpriced_lines(
         )
         existing.add(code)
         added = True
+
+    # And close the ones whose line is gone. Answering "Сосна гірська" with a
+    # substitute renames the line, so the price question raised under the old
+    # name asks about something the estimate no longer contains -- and an open
+    # question is itself a NEEDS_USER_INPUT, so it held the export shut over a
+    # line that had been priced and renamed several rebuilds ago.
+    live = {normalize_name(l.name)[:90] for l in estimate.lines if l.quantity > 0}
+    stale = [
+        q
+        for q in session.scalars(
+            select(Question).where(
+                Question.project_id == project.id,
+                Question.status == "open",
+            )
+        ).all()
+        if q.code.startswith("price:") and q.code[len("price:"):] not in live
+    ]
+    for question in stale:
+        question.status = "dismissed"
+        question.answer = (
+            "Позиції немає в кошторисі — її замінено іншою у відповідь на "
+            "попереднє питання."
+        )
+        added = True
+
     if added:
         session.commit()
 
