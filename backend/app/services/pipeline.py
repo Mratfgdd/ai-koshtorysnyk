@@ -581,6 +581,23 @@ def _from_analysis(
     quantities: dict[str, dict[str, float]] = {}
     notes: list[str] = []
     unresolved: list[dict[str, Any]] = []
+    # Which reading contributed to which row. A drawing lists a cable in eleven
+    # runs and a template row is one line, so the runs add up — but the same
+    # reading often reaches us twice, once as a fact and once as a component,
+    # and adding that to itself would double it. Keyed by what was read, so a
+    # repeat of one reading counts once and eleven separate ones count eleven.
+    counted: set[tuple[str, str, str]] = set()
+
+    def record(section: str, row: str, value: float, source: str) -> bool:
+        key = (section, normalize_name(row), normalize_name(source))
+        if key in counted:
+            return False
+        counted.add(key)
+        rows = quantities.setdefault(section, {})
+        rows[row] = rows.get(row, 0.0) + value
+        if section not in sections:
+            sections.append(section)
+        return True
 
     search = CatalogSearch(session)
     billing_units = {normalize_unit(i.unit) for i in search.items if i.unit}
@@ -629,10 +646,13 @@ def _from_analysis(
             notes.append(f"«{label}» ({value:g} {unit}) — {reason}")
             continue
 
-        quantities.setdefault(section, {})[article] = value
-        if section not in sections:
-            sections.append(section)
-        notes.append(f"«{label}» → «{article}» ({kind}), {value:g} {unit}.")
+        if record(section, article, value, label):
+            total = quantities[section][article]
+            notes.append(
+                f"«{label}» → «{article}» ({kind}), {value:g} {unit}"
+                + (f"; разом по рядку {total:g}" if total != value else "")
+                + "."
+            )
 
     for entry in analysis.components or []:
         name = str(entry.get("name", "")).strip()
@@ -655,10 +675,13 @@ def _from_analysis(
             notes.append(f"«{name}» ({value:g} {unit}) — {reason}")
             continue
 
-        quantities.setdefault(section, {})[target] = value
-        if section not in sections:
-            sections.append(section)
-        notes.append(f"«{name}» → «{target}» ({kind}), {value:g} {unit}.")
+        if record(section, target, value, name):
+            total = quantities[section][target]
+            notes.append(
+                f"«{name}» → «{target}» ({kind}), {value:g} {unit}"
+                + (f"; разом по рядку {total:g}" if total != value else "")
+                + "."
+            )
 
     plants = [
         {

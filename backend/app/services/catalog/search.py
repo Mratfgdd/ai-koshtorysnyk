@@ -136,12 +136,60 @@ def normalize_unit(unit: str) -> str:
     return normalize_name(unit).replace(".", "").replace(" ", "")
 
 
+# A run of dimensions with an optional unit: "1200х400", "120х40х6см",
+# "100х50х50 см", "50х25х4,4см".
+DIMENSION_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*[x×хХ*]\s*(\d+(?:[.,]\d+)?)"
+    r"(?:\s*[x×хХ*]\s*(\d+(?:[.,]\d+)?))?"
+    r"\s*(мм|см|м)?\b",
+    re.IGNORECASE,
+)
+
+_TO_MM = {"мм": 1.0, "см": 10.0, "м": 1000.0}
+
+
+def dimension_forms(name: str) -> set[str]:
+    """Every dimension in a name, as pairs of millimetres.
+
+    Two names describe the same object in different units all the time: a
+    drawing writes "Плити 1200х400" and the price base writes "Плита ходова
+    бетонна 120х40х6см". Compared as written those share nothing, and because
+    each carries a size token that the other lacks, the scorer used to subtract
+    25 for a size disagreement -- pushing apart two names for one product.
+
+    So each run of numbers is converted to millimetres. Where no unit is
+    written the reading is genuinely ambiguous, and both are emitted rather
+    than assumed: 1200х400 is either 1200 mm or 1200 cm and only the other name
+    can say which.
+
+    Emitted pairwise rather than as one token so that a name giving two
+    dimensions meets a name giving three. The base lists a thickness the
+    drawing does not, and "120х40х6см" must still meet "1200х400".
+    """
+    out: set[str] = set()
+    for found in DIMENSION_RE.finditer(name or ""):
+        numbers = [
+            float(g.replace(",", "."))
+            for g in (found.group(1), found.group(2), found.group(3))
+            if g
+        ]
+        unit = (found.group(4) or "").lower()
+        scales = [_TO_MM[unit]] if unit in _TO_MM else [1.0, 10.0]
+        for scale in scales:
+            millimetres = sorted(round(n * scale) for n in numbers)
+            for i, first in enumerate(millimetres):
+                for second in millimetres[i + 1:]:
+                    out.add(f"{first}x{second}мм")
+    return out
+
+
 def specs(name: str) -> set[str]:
     """Extract the size/spec tokens that must agree between two product names."""
-    return {
+    written = {
         re.sub(r"\s+", "", m.group(0).lower().replace(",", ".").replace("х", "x").replace("×", "x"))
         for m in SPEC_RE.finditer(name or "")
     }
+    return written | dimension_forms(name)
 
 
 def _keywords(name: str) -> list[str]:
@@ -351,6 +399,8 @@ class CatalogSearch:
         unit: str | None = None,
         accept_at: float = 92.0,
         ambiguous_gap: float = 6.0,
+        confident_at: float = 80.0,
+        confident_margin: float = 25.0,
     ) -> MatchResult:
         """Resolve a requested item to a catalog row, or refuse to.
 
@@ -404,14 +454,33 @@ class CatalogSearch:
 
         best = candidates[0]
         runner_up = candidates[1].score if len(candidates) > 1 else 0.0
+        margin = best.score - runner_up
 
-        if best.score >= accept_at and (best.score - runner_up) >= ambiguous_gap:
+        # Two ways to be sure, and a candidate needs one of them.
+        #
+        # A high score with the field close behind is the original test: the
+        # name is nearly the base's own wording.
+        #
+        # A lower score with the field far behind is the other. A drawing that
+        # writes "Кабель ВВГ-нг 3х2,5 — група 01" scores 85 against the base's
+        # "Електричний кабель 3х2.5 ВВГ НГ LS" — too little prose in common for
+        # 92 — while the next candidate, a cable of a different cross-section,
+        # scores 42. Forty-three points of daylight is not a close call, and
+        # refusing it made the estimator answer a question whose answer was the
+        # only thing on the list. The margin is measured the same way for every
+        # article; nothing here knows what a cable is.
+        decisive = best.score >= accept_at and margin >= ambiguous_gap
+        clear = best.score >= confident_at and margin >= confident_margin
+        if decisive or clear:
             return MatchResult(
                 status="matched",
                 best=best,
                 candidates=candidates,
-                confidence="high" if best.score >= 97 else "medium",
-                reason=f"Найкращий кандидат з відривом ({best.score:.0f} проти {runner_up:.0f}).",
+                confidence="high" if best.score >= 97 or clear else "medium",
+                reason=(
+                    f"Найкращий кандидат з відривом ({best.score:.0f} проти "
+                    f"{runner_up:.0f}, відрив {margin:.0f})."
+                ),
             )
 
         if best.score >= 70:
