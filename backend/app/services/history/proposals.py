@@ -258,163 +258,167 @@ def _section_marker(text: str) -> str | None:
 
 
 def parse_proposal(path: Path) -> Proposal:
-    """Read one issued proposal into rows, subtotals and invoice figures."""
+    """Read one issued proposal into rows, subtotals and invoice figures.
+
+    The document is held open for the length of the parse and closed by the
+    context manager. It used to be closed by a plain call at the end, which any
+    exception in the loop below would skip -- and a PDF left open is a file that
+    cannot be replaced or deleted on Windows.
+    """
     proposal = Proposal(project=path.stem, path=str(path))
-    doc = pymupdf.open(path)
+    with pymupdf.open(path) as doc:
+        section = ""
+        block = "materials"
+        cols: dict[str, float] | None = None
+        in_summary = False
+        pending_name = ""
+        # The row a trailing wrapped line would belong to, and where that row sits.
+        last_row: Row | None = None
+        last_row_y = 0.0
 
-    section = ""
-    block = "materials"
-    cols: dict[str, float] | None = None
-    in_summary = False
-    pending_name = ""
-    # The row a trailing wrapped line would belong to, and where that row sits.
-    last_row: Row | None = None
-    last_row_y = 0.0
+        for page in doc:
+            bands = _bands(page)
+            last_row = None
+            for index, band in enumerate(bands):
+                line = " ".join(w[4] for w in band).strip()
+                if not line:
+                    continue
+                y = band[0][1]
+                next_y = bands[index + 1][0][1] if index + 1 < len(bands) else None
 
-    for page in doc:
-        bands = _bands(page)
-        last_row = None
-        for index, band in enumerate(bands):
-            line = " ".join(w[4] for w in band).strip()
-            if not line:
-                continue
-            y = band[0][1]
-            next_y = bands[index + 1][0][1] if index + 1 < len(bands) else None
-
-            header = _columns(band)
-            if header is not None:
-                cols = header
-                # "# Матеріали" and "К-сть … Сума" print 3pt apart and merge
-                # into one band, so the block title is read off this same row:
-                # it is the text left of the quantity column, minus the "#".
-                title = " ".join(
-                    w[4] for w in band if w[0] < header["qty"] and w[4] != "#"
-                ).strip()
-                if title.startswith(("Матеріали за видами", "Робота за видами")):
-                    in_summary = True
-                else:
-                    block = block_of_title(title) or block
-                pending_name = ""
-                last_row = None
-                continue
-
-            if band[0][4] == "#":
-                title = " ".join(w[4] for w in band[1:]).strip()
-                if title.startswith(("Матеріали за видами", "Робота за видами")):
-                    in_summary = True
-                else:
-                    block = block_of_title(title) or block
-                pending_name = ""
-                last_row = None
-                continue
-
-            if line.startswith("Рахунок загальний"):
-                in_summary = True
-                pending_name = ""
-                last_row = None
-                continue
-
-            if cols is None:
-                # The first section marker prints above the first table, so it
-                # arrives before any column header has been seen.
-                section = _section_marker(line) or section
-                continue
-
-            cells = _cells(band, cols)
-            total = as_number(cells["total"])
-
-            label = line.strip()
-            if label.startswith("0 "):
-                label = label[2:].strip()
-            found = SUBTOTAL_RE.search(label)
-            if found:
-                key = BLOCK_OF[found.group(1)]
-                if total is not None:
-                    if in_summary:
-                        proposal.invoice[key] = total
+                header = _columns(band)
+                if header is not None:
+                    cols = header
+                    # "# Матеріали" and "К-сть … Сума" print 3pt apart and merge
+                    # into one band, so the block title is read off this same row:
+                    # it is the text left of the quantity column, minus the "#".
+                    title = " ".join(
+                        w[4] for w in band if w[0] < header["qty"] and w[4] != "#"
+                    ).strip()
+                    if title.startswith(("Матеріали за видами", "Робота за видами")):
+                        in_summary = True
                     else:
-                        # A section can print this line more than once — once per
-                        # sub-table (the pump station) and once per page a long
-                        # table spans. Each closes a part of the same block, so
-                        # they add up; taking the last would keep only the tail.
-                        acc = f"{section}|{key}"
-                        proposal.block_totals[acc] = (
-                            proposal.block_totals.get(acc, 0.0) + total
-                        )
-                pending_name = ""
-                last_row = None
-                continue
+                        block = block_of_title(title) or block
+                    pending_name = ""
+                    last_row = None
+                    continue
 
-            matched = False
-            for text_label, key in INVOICE_LABELS:
-                if label.startswith(text_label):
+                if band[0][4] == "#":
+                    title = " ".join(w[4] for w in band[1:]).strip()
+                    if title.startswith(("Матеріали за видами", "Робота за видами")):
+                        in_summary = True
+                    else:
+                        block = block_of_title(title) or block
+                    pending_name = ""
+                    last_row = None
+                    continue
+
+                if line.startswith("Рахунок загальний"):
+                    in_summary = True
+                    pending_name = ""
+                    last_row = None
+                    continue
+
+                if cols is None:
+                    # The first section marker prints above the first table, so it
+                    # arrives before any column header has been seen.
+                    section = _section_marker(line) or section
+                    continue
+
+                cells = _cells(band, cols)
+                total = as_number(cells["total"])
+
+                label = line.strip()
+                if label.startswith("0 "):
+                    label = label[2:].strip()
+                found = SUBTOTAL_RE.search(label)
+                if found:
+                    key = BLOCK_OF[found.group(1)]
                     if total is not None:
-                        proposal.invoice[key] = total
-                    matched = True
-                    break
-            if matched:
-                pending_name = ""
-                last_row = None
-                continue
-
-            if label.startswith("Разом"):
-                # From the wording alone, not the whole line: the line carries
-                # its figure too and it would end up inside the key.
-                name = cells["label"].strip()
-                if name.startswith("0 "):
-                    name = name[2:].strip()
-                name = name[len("Разом"):].strip().rstrip(":").strip()
-                bare = name[len("за "):].strip() if name.startswith("за ") else name
-                if (
-                    total is not None
-                    and not in_summary
-                    and bare.lower() not in SUBGROUP_TOTALS
-                ):
-                    proposal.section_totals[bare or section] = total
-                pending_name = ""
-                last_row = None
-                continue
-
-            quantity = as_number(cells["qty"])
-            price = as_number(cells["price"])
-            name = cells["name"].strip()
-
-            if quantity is not None and price is not None and total is not None:
-                if not in_summary:
-                    full = f"{pending_name} {name}".strip()
-                    if full:
-                        row = Row(section or "misc", block, full, quantity,
-                                  cells["unit"].strip(), price, total)
-                        proposal.rows.append(row)
-                        last_row, last_row_y = row, y
-                pending_name = ""
-                continue
-
-            # No numbers on this band: a section marker, or a line of a name too
-            # long for its cell. A wrapped name can spill either way — above the
-            # numbers or below them — so it goes to whichever row it sits closer
-            # to, which is where Excel drew it.
-            if name and quantity is None and price is None and total is None:
-                marker = _section_marker(name)
-                if marker is not None:
-                    section = marker
+                        if in_summary:
+                            proposal.invoice[key] = total
+                        else:
+                            # A section can print this line more than once — once per
+                            # sub-table (the pump station) and once per page a long
+                            # table spans. Each closes a part of the same block, so
+                            # they add up; taking the last would keep only the tail.
+                            acc = f"{section}|{key}"
+                            proposal.block_totals[acc] = (
+                                proposal.block_totals.get(acc, 0.0) + total
+                            )
                     pending_name = ""
                     last_row = None
-                elif name.rstrip().endswith(":") and len(name.rstrip()) < 80:
+                    continue
+
+                matched = False
+                for text_label, key in INVOICE_LABELS:
+                    if label.startswith(text_label):
+                        if total is not None:
+                            proposal.invoice[key] = total
+                        matched = True
+                        break
+                if matched:
                     pending_name = ""
                     last_row = None
-                elif (
-                    last_row is not None
-                    and next_y is not None
-                    and (y - last_row_y) < (next_y - y)
-                ):
-                    last_row.name = f"{last_row.name} {name}".strip()
-                else:
-                    pending_name = name
-                continue
-            pending_name = ""
+                    continue
 
-    doc.close()
+                if label.startswith("Разом"):
+                    # From the wording alone, not the whole line: the line carries
+                    # its figure too and it would end up inside the key.
+                    name = cells["label"].strip()
+                    if name.startswith("0 "):
+                        name = name[2:].strip()
+                    name = name[len("Разом"):].strip().rstrip(":").strip()
+                    bare = name[len("за "):].strip() if name.startswith("за ") else name
+                    if (
+                        total is not None
+                        and not in_summary
+                        and bare.lower() not in SUBGROUP_TOTALS
+                    ):
+                        proposal.section_totals[bare or section] = total
+                    pending_name = ""
+                    last_row = None
+                    continue
+
+                quantity = as_number(cells["qty"])
+                price = as_number(cells["price"])
+                name = cells["name"].strip()
+
+                if quantity is not None and price is not None and total is not None:
+                    if not in_summary:
+                        full = f"{pending_name} {name}".strip()
+                        if full:
+                            row = Row(section or "misc", block, full, quantity,
+                                      cells["unit"].strip(), price, total)
+                            proposal.rows.append(row)
+                            last_row, last_row_y = row, y
+                    pending_name = ""
+                    continue
+
+                # No numbers on this band: a section marker, or a line of a name too
+                # long for its cell. A wrapped name can spill either way — above the
+                # numbers or below them — so it goes to whichever row it sits closer
+                # to, which is where Excel drew it.
+                if name and quantity is None and price is None and total is None:
+                    marker = _section_marker(name)
+                    if marker is not None:
+                        section = marker
+                        pending_name = ""
+                        last_row = None
+                    elif name.rstrip().endswith(":") and len(name.rstrip()) < 80:
+                        pending_name = ""
+                        last_row = None
+                    elif (
+                        last_row is not None
+                        and next_y is not None
+                        and (y - last_row_y) < (next_y - y)
+                    ):
+                        last_row.name = f"{last_row.name} {name}".strip()
+                    else:
+                        pending_name = name
+                    continue
+                pending_name = ""
+
     return proposal
 
 

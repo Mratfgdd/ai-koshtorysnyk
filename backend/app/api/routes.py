@@ -8,7 +8,9 @@ without a running server.
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,48 @@ from ..services.validation.validators import validate
 _MULTIPART_OVERHEAD = 8 * 1024  # boundary + headers slack
 
 log = logging.getLogger(__name__)
+
+
+def _storage_problem(directory: Path, exc: OSError) -> str:
+    """A filesystem refusal, phrased so the person reading it can act.
+
+    Uploads land in DATA_DIR, which the service does not own: it is created by
+    whoever set the machine up, and a maintenance script run as root leaves
+    directories root can write and the service cannot. The upload then fails on
+    the first byte with "Permission denied" and nothing else, which reads like a
+    bug in the PDF handling and is not one.
+    """
+    if isinstance(exc, PermissionError):
+        return (
+            f"Немає прав на запис у теку «{directory}». Її створено іншим "
+            "користувачем — імовірно, скриптом обслуговування від root. "
+            "Виправлення на сервері: "
+            f"chown -R estimator:estimator {get_settings().data_dir}"
+        )
+    if getattr(exc, "errno", None) == errno.ENOSPC:
+        return f"На диску немає місця для «{directory}»."
+    return f"Не вдалося записати у «{directory}»: {exc.strerror or exc}."
+
+
+def _unwritable_storage() -> list[str]:
+    """Directories the service is expected to write to and cannot.
+
+    Checked with ``os.access`` rather than by writing a probe file: this runs on
+    every health poll, and the answer is wanted before a user finds it by losing
+    an upload. Per-project upload directories are included because that is where
+    the fault appeared -- the tree root stayed writable while two directories
+    inside it did not.
+    """
+    roots = [settings.data_dir, settings.upload_dir, settings.cache_dir,
+             settings.page_image_dir]
+    if settings.upload_dir.is_dir():
+        roots += [p for p in settings.upload_dir.iterdir() if p.is_dir()]
+    return [
+        str(p) for p in roots
+        if p.exists() and not os.access(p, os.W_OK | os.X_OK)
+    ]
+
+
 router = APIRouter()
 settings = get_settings()
 
@@ -113,8 +157,13 @@ def health(session: Session = Depends(get_session)) -> dict[str, Any]:
     except FileNotFoundError:
         sections = rules = 0
 
+    unwritable = _unwritable_storage()
     return {
-        "status": "ok",
+        "status": "ok" if not unwritable else "degraded",
+        # Named directly rather than as a bare boolean: the operator needs the
+        # path to fix it, and an upload that lands in an unwritable directory
+        # fails on its first byte with nothing but "Permission denied".
+        "storage_unwritable": unwritable,
         "catalog_items": catalog_count,
         "template_sections": sections,
         "quantity_rules": rules,
@@ -307,7 +356,10 @@ async def upload_document(
         )
 
     target_dir = settings.upload_dir / str(project.id)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(500, _storage_problem(target_dir, exc)) from exc
     target = target_dir / Path(file.filename).name
 
     # Stream in chunks and stop the moment the limit is passed, rather than
@@ -325,6 +377,13 @@ async def upload_document(
     except HTTPException:
         target.unlink(missing_ok=True)
         raise
+    except PermissionError as exc:
+        # The directory exists but the service cannot write into it, so there is
+        # nothing to clean up and no point retrying. Say which directory and who
+        # has to own it: a bare "Permission denied" sends the operator looking
+        # for a bug in the parser, which is where this was hunted for once.
+        log.error("upload refused by the filesystem: %s", target, exc_info=True)
+        raise HTTPException(500, _storage_problem(target_dir, exc)) from exc
     except Exception:
         target.unlink(missing_ok=True)
         raise
