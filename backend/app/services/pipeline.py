@@ -891,6 +891,41 @@ def _catalog_units(session: Session) -> dict[str, str]:
     return {name: unit for name, unit in rows if unit}
 
 
+def _plant_size_question(
+    project: Project,
+    estimate: Estimate,
+    name: str,
+    entry: dict[str, Any],
+    options: list[dict[str, Any]],
+) -> Question:
+    """Ask which size, priced, instead of asking for a price.
+
+    A schedule that writes "Сосна гірська" with no container has not named an
+    article: the invoices carry that plant in four sizes from 950 to 3900 грн.
+    The system will not pick one, but it knows all four and what each was sold
+    for, so the estimator answers by choosing rather than by ringing a nursery.
+    """
+    return Question(
+        project_id=project.id,
+        estimate_id=estimate.id,
+        group="Розміри рослин",
+        code=f"price:{normalize_name(name)[:90]}",
+        text=f"Який розмір «{name}» закладати?",
+        why=(
+            "У відомості розмір не вказано, а саме він визначає ціну. "
+            f"Ця рослина продавалась у {len(options)} варіантах — "
+            "оберіть той, що у проєкті."
+        ),
+        kind="choice",
+        choices=[
+            f"{o['name']} — {o['unit_price']:g} грн"
+            + (f" ({o['issued']})" if o.get("issued") else "")
+            for o in options
+        ],
+        affects=[entry.get("section", "planting")],
+    )
+
+
 def _questions_from_build(
     session: Session,
     project: Project,
@@ -949,32 +984,32 @@ def _questions_from_build(
         if line.block != "plants" or line.quantity <= 0 or line.unit_price > 0:
             continue
         code = f"price:{normalize_name(line.name)[:90]}"
-        if code in existing:
-            continue
         entry = sized.get(normalize_name(line.name))
         if entry:
             options = entry["options"]
-            session.add(
-                Question(
-                    project_id=project.id,
-                    estimate_id=estimate.id,
-                    group="Розміри рослин",
-                    code=code,
-                    text=f"Який розмір «{line.name}» закладати?",
-                    why=(
-                        "У відомості розмір не вказано, а саме він визначає ціну. "
-                        f"Ця рослина продавалась у {len(options)} варіантах — "
-                        "оберіть той, що у проєкті."
-                    ),
-                    kind="choice",
-                    choices=[
-                        f"{o['name']} — {o['unit_price']:g} грн"
-                        + (f" ({o['issued']})" if o.get("issued") else "")
-                        for o in options
-                    ],
-                    affects=[entry.get("section", "planting")],
-                )
-            )
+            asked = _plant_size_question(project, estimate, line.name, entry, options)
+            if code in existing:
+                # The same plant was already asked the old way, as a bare "what
+                # does it cost". That question is still open and we can now ask
+                # a better one; skipping on the code would freeze the worse
+                # version in place for every project that ever saw it.
+                previous = session.scalars(
+                    select(Question).where(
+                        Question.project_id == project.id, Question.code == code
+                    )
+                ).first()
+                if previous is None or previous.answer:
+                    continue
+                previous.group = asked.group
+                previous.text = asked.text
+                previous.why = asked.why
+                previous.kind = asked.kind
+                previous.choices = asked.choices
+                previous.estimate_id = estimate.id
+                continue
+            session.add(asked)
+            continue
+        if code in existing:
             continue
         session.add(
             Question(
