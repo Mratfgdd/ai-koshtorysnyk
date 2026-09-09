@@ -1033,6 +1033,21 @@ def _questions_from_build(
 # --- step 3: answers and recalculation --------------------------------------
 
 
+def _chosen_article(session: Session, answer: str):
+    """The price-history entry the estimator picked out of a size question.
+
+    The choices are rendered "<article> — <price> грн (<issued>)", so the name
+    is what stands before the dash. Returns ``None`` when the answer is free
+    text rather than one of the offered options.
+    """
+    from .history.prices import InvoicedPrices
+
+    name = answer.split("—")[0].strip() if "—" in answer else answer.strip()
+    if not name:
+        return None
+    return InvoicedPrices.from_db(session).exact(name)
+
+
 def apply_answer(session: Session, estimate: Estimate, question: Question) -> None:
     """Apply one answer to the estimate it affects."""
     answer = (question.answer or "").strip()
@@ -1041,15 +1056,41 @@ def apply_answer(session: Session, estimate: Estimate, question: Question) -> No
 
     if question.code.startswith("price:"):
         target = question.code[len("price:"):]
+        price = _as_float(answer)
+        chosen = None
+        if price is None:
+            # A size question is answered by picking one of its own labels —
+            # "Сосна гірська, d20-30см — 950 грн (15.06.2026)". The figure is
+            # read back out of the price history by the article's name rather
+            # than parsed out of the label: the history is where it came from,
+            # and a label is for reading.
+            chosen = _chosen_article(session, answer)
+            if chosen is not None:
+                price = chosen.unit_price
+        if price is None:
+            return
         for line in estimate.lines:
             if normalize_name(line.name).startswith(target):
-                price = _as_float(answer)
-                if price is not None:
-                    line.unit_price = price
-                    line.total = round(line.quantity * price, 2)
+                line.unit_price = price
+                line.total = round(line.quantity * price, 2)
+                if chosen is not None:
+                    # The schedule said "Сосна гірська"; the estimate should say
+                    # which one, or the proposal names a plant nobody can order.
+                    line.name = chosen.name
+                    line.unit = chosen.unit or line.unit
+                    line.source_refs = list(line.source_refs or []) + [{
+                        "source_type": "historical_estimate",
+                        "source_ref": chosen.project,
+                        "detail": chosen.trace(),
+                    }]
+                    line.reasons = list(line.reasons or []) + [
+                        f"Розмір обрано користувачем: {chosen.name}."
+                    ]
+                else:
                     line.reasons = list(line.reasons or []) + [
                         "Ціну внесено користувачем у відповідь на питання."
                     ]
+                line.confidence = "high"
         session.commit()
         return
 
