@@ -88,8 +88,13 @@ def as_number(text: str) -> float | None:
 # The printed КП leaves "Дата рахунку" blank and the PDFs carry no metadata, so
 # the only date these documents hold is the one in their own filename.
 EXPLICIT_DATE_RE = re.compile(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})")
-QUARTER_RE = re.compile(r"\((\d)\s*кв[а-яі]*\)", re.IGNORECASE)
-YEAR_RE = re.compile(r"\b(20\d{2})\b")
+# "(1 Квартал)" and "2_квартал" are the same statement. Requiring the brackets
+# made "КП_2026_2_квартал_…" undated, which sorts it oldest — the opposite of
+# what it is, and enough to lose it every tie in the "last sold price" rule.
+QUARTER_RE = re.compile(r"(\d)[\s_]*кв[а-яі]*", re.IGNORECASE)
+# Not \b: an underscore is a word character, so "КП_2026_2_квартал" has no
+# boundary around its year and the whole name read as undated.
+YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 
 # The last day of each quarter: a proposal is dated no later than this, and two
 # proposals from the same quarter get the same key, which is the truth here.

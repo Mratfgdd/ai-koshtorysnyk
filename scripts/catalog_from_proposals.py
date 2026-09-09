@@ -51,6 +51,20 @@ from app.services.rules.engine import normalize_name  # noqa: E402
 # workbook, so a later import of «2026 База 1» can tell them apart.
 SOURCE_PREFIX = "КП:"
 
+# The proposal already sorted the article into a block when it printed it under
+# "Матеріали", "Робота" or "Рослини". That is the company's own classification
+# and beats guessing from the name: "Клен Фрімана" has no marker that says plant.
+BLOCK_KIND = {"plants": "plant", "works": "work", "materials": "material"}
+
+
+def kind_of(last) -> str:
+    kind = BLOCK_KIND.get(last.block)
+    if kind == "material":
+        # Labour billed per m² sits in the works block already; this catches the
+        # rows the proposal filed under materials that read as work.
+        return classify_kind(last.name, last.unit, "")
+    return kind or "material"
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -101,7 +115,7 @@ def main() -> int:
         print(f"{'артикул':<50} {'од':<6} {'ціна':>10}  {'вид':<9} джерело")
         print("-" * 108)
         for last in additions[: args.show]:
-            kind = classify_kind(last.name, last.unit, "")
+            kind = kind_of(last)
             print(f"{last.name[:48]:<50} {last.unit:<6} {last.unit_price:>10,.2f}  "
                   f"{kind:<9} {last.project[-34:]}")
         if len(additions) > args.show:

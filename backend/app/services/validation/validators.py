@@ -290,12 +290,61 @@ def check_duplicates(draft: Draft, totals: EstimateTotals, ctx: dict[str, Any]):
             )
 
 
+def _sold_before(line: DraftLine) -> str | None:
+    """Where this line's price was actually charged, if it was.
+
+    Strict on purpose, because the whole point of the not-in-catalogue block is
+    that the system must not put a number on a line it cannot account for. Three
+    things must all hold, and none of them can be produced by guessing:
+
+    * the line carries a price above zero;
+    * it carries a ``historical_estimate`` reference, which only
+      :meth:`EstimateBuilder._apply_last_sold` attaches, and only from a row of
+      a proposal that reconciled with its own printed subtotals;
+    * that reference names the proposal.
+
+    A price typed in by hand does not qualify -- that one keeps its question,
+    because a person's number is a decision to record, not a sale to cite.
+    """
+    if line.unit_price <= 0:
+        return None
+    for ref in line.source_refs or []:
+        if not isinstance(ref, dict):
+            continue
+        if ref.get("source_type") != "historical_estimate":
+            continue
+        source = str(ref.get("source_ref") or "").strip()
+        if source:
+            return f"КП «{source[:60]}»"
+    return None
+
+
 @validator
 def check_matching(draft: Draft, totals: EstimateTotals, ctx: dict[str, Any]):
     for line in billable(draft):
         if line.quantity <= 0:
             continue
         if line.match_status == "not_in_catalog":
+            sold = _sold_before(line)
+            if sold is not None:
+                # Priced by a proposal the company issued and the customer
+                # signed. The article is missing from «2026 База 1», which is a
+                # gap in the base rather than an unknown price, so this is worth
+                # saying and not worth blocking the export over.
+                yield Finding(
+                    code="priced_from_history",
+                    severity=WARNING,
+                    title=f"Ціна з історії КП: «{line.name}»",
+                    detail=(
+                        f"Позиції немає в «2026 База 1», але вона продавалась: "
+                        f"{sold}. Ціну взято звідти, не вигадано."
+                    ),
+                    fix_hint="Внесіть позицію в прайс, щоб вона була в базі й надалі.",
+                    impact=f"У підсумку враховано {_money(line.total)} грн.",
+                    line_name=line.name,
+                    section=line.section,
+                )
+                continue
             yield Finding(
                 code="not_in_catalog",
                 severity=NEEDS_USER_INPUT,
