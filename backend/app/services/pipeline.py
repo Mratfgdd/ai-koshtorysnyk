@@ -824,7 +824,7 @@ def _resolve_coverage_target(
     match = search.match(name)
     if match.status == "matched" and match.best is not None:
         candidate = match.best.item
-        home = _section_of_article(candidate.name, layout)
+        home = _section_of_article(candidate.name, layout, prefer=section)
         if home is None and section not in layout.sections:
             return (
                 None,
@@ -866,15 +866,36 @@ def _resolve_coverage_target(
     return None, "", "позиції немає в каталозі під цією назвою"
 
 
-def _section_of_article(name: str, layout: TemplateLayout) -> str | None:
-    """Which template section contains this article."""
+def _section_of_article(
+    name: str, layout: TemplateLayout, prefer: str | None = None
+) -> str | None:
+    """Which template section contains this article.
+
+    ``prefer`` wins when it carries the article, because most of the overheads
+    are in every section by design and this used to hand them all to whichever
+    one the template lists first. "Транспортні витрати" appears in thirteen
+    sections and always resolved to prep; "Пісок" in ten, likewise; agrofabric
+    in three and always to Доріжка. So a drawing's planting fabric was billed
+    under paving, and — worse — the planting section's own input row stayed at
+    zero, which is what the rest of that section is derived from. Every rule
+    hanging off it stayed silent: the bed preparation, the consumables, the
+    transport, the logistics.
+    """
     key = normalize_name(name)
+
+    def carries(section: str) -> bool:
+        return any(
+            line["block"] != "driver" and normalize_name(line["name"]) == key
+            for line in layout.lines(section)
+        )
+
+    if prefer and prefer != "summary" and prefer in layout.sections and carries(prefer):
+        return prefer
     for section in layout.order:
         if section == "summary":
             continue
-        for line in layout.lines(section):
-            if line["block"] != "driver" and normalize_name(line["name"]) == key:
-                return section
+        if carries(section):
+            return section
     return None
 
 
