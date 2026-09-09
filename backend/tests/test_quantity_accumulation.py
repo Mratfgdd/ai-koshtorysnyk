@@ -65,6 +65,83 @@ def test_a_name_with_no_dimensions_yields_none() -> None:
     assert dimension_forms("") == set()
 
 
+# --- one row, several readings -------------------------------------------------
+
+
+def _mapping(facts, components):
+    """Run the analysis-to-quantities step over a made-up analysis."""
+    import pytest
+
+    from app.db import SessionLocal, init_db
+    from app.models import CatalogItem, ObjectAnalysis
+    from app.services.estimate.builder import TemplateLayout
+    from app.services.pipeline import _from_analysis
+    from sqlalchemy import select
+
+    init_db()
+    session = SessionLocal()
+    if session.scalar(select(CatalogItem).limit(1)) is None:
+        session.close()
+        pytest.skip("catalog not imported; run scripts/import_catalog.py")
+    try:
+        layout = TemplateLayout.load()
+    except FileNotFoundError:
+        session.close()
+        pytest.skip("template not compiled")
+
+    analysis = ObjectAnalysis(project_id=0, facts=facts, components=components,
+                             plants=[], systems=[])
+    return _from_analysis(analysis, layout, session)["quantities"]
+
+
+def _total(quantities, needle):
+    for rows in quantities.values():
+        for name, value in rows.items():
+            if needle.lower() in name.lower():
+                return value
+    return None
+
+
+def test_several_runs_of_one_article_add_up() -> None:
+    """A drawing states a cable in runs; the estimate has one line for it."""
+    facts = [
+        {"label": f"Кабель ВВГ-нг 3х2,5 — група {n:02d}", "value": v, "unit": "м.п",
+         "status": "confirmed", "section": "lighting"}
+        for n, v in ((1, 42), (2, 58), (3, 45))
+    ]
+    total = _total(_mapping(facts, []), "кабель 3х2.5")
+    assert total == 145, f"42 + 58 + 45, got {total}"
+
+
+def test_one_reading_reported_twice_is_counted_once() -> None:
+    """The analysis reports the same schedule row as a fact and as a component,
+    under two spellings. That is one reading of one drawing, not two runs."""
+    facts = [{"label": "Агрополотно 50 г/м², чорне", "value": 152, "unit": "м²",
+              "status": "confirmed", "section": "prep"}]
+    components = [{"name": "Агрополотно", "quantity": 152, "unit": "м²",
+                   "section": "prep"}]
+    total = _total(_mapping(facts, components), "агрополотно")
+    assert total == 152, f"the drawing says 152, got {total}"
+
+
+def test_the_larger_reading_wins_when_the_views_disagree() -> None:
+    facts = [{"label": "Агрополотно 50 г/м², чорне", "value": 152, "unit": "м²",
+              "status": "confirmed", "section": "prep"}]
+    components = [{"name": "Агрополотно", "quantity": 175, "unit": "м²",
+                   "section": "prep"}]
+    assert _total(_mapping(facts, components), "агрополотно") == 175
+
+
+def test_the_same_reading_twice_in_one_view_counts_once() -> None:
+    facts = [
+        {"label": "Агрополотно 50 г/м², чорне", "value": 152, "unit": "м²",
+         "status": "confirmed", "section": "prep"},
+        {"label": "Агрополотно 50 г/м², чорне", "value": 152, "unit": "м²",
+         "status": "confirmed", "section": "prep"},
+    ]
+    assert _total(_mapping(facts, []), "агрополотно") == 152
+
+
 # --- a clear leader is a match, a crowded field is a question ------------------
 
 

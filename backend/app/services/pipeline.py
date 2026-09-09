@@ -581,20 +581,27 @@ def _from_analysis(
     quantities: dict[str, dict[str, float]] = {}
     notes: list[str] = []
     unresolved: list[dict[str, Any]] = []
-    # Which reading contributed to which row. A drawing lists a cable in eleven
-    # runs and a template row is one line, so the runs add up — but the same
-    # reading often reaches us twice, once as a fact and once as a component,
-    # and adding that to itself would double it. Keyed by what was read, so a
-    # repeat of one reading counts once and eleven separate ones count eleven.
-    counted: set[tuple[str, str, str]] = set()
+    # A drawing lists a cable in eleven runs and a template row is one line, so
+    # the runs add up. But the analysis reports the same drawing twice — as
+    # facts and as components — and the two views name things differently:
+    # "Агрополотно 50 г/м², чорне" against "Агрополотно", one schedule row read
+    # twice. Adding those gave 304 m² of fabric where the drawing says 152.
+    #
+    # So each view accumulates on its own and the views do not add to each
+    # other: the row takes the larger of them. Eleven readings inside one view
+    # are eleven runs; one reading in each view is one run seen twice.
+    by_origin: dict[tuple[str, str], dict[str, float]] = {}
+    counted: set[tuple[str, str, str, str]] = set()
 
-    def record(section: str, row: str, value: float, source: str) -> bool:
-        key = (section, normalize_name(row), normalize_name(source))
+    def record(section: str, row: str, value: float, source: str, origin: str) -> bool:
+        key = (section, normalize_name(row), origin, normalize_name(source))
         if key in counted:
             return False
         counted.add(key)
+        totals = by_origin.setdefault((section, row), {})
+        totals[origin] = totals.get(origin, 0.0) + value
         rows = quantities.setdefault(section, {})
-        rows[row] = rows.get(row, 0.0) + value
+        rows[row] = max(totals.values())
         if section not in sections:
             sections.append(section)
         return True
@@ -646,7 +653,7 @@ def _from_analysis(
             notes.append(f"«{label}» ({value:g} {unit}) — {reason}")
             continue
 
-        if record(section, article, value, label):
+        if record(section, article, value, label, "fact"):
             total = quantities[section][article]
             notes.append(
                 f"«{label}» → «{article}» ({kind}), {value:g} {unit}"
@@ -675,7 +682,7 @@ def _from_analysis(
             notes.append(f"«{name}» ({value:g} {unit}) — {reason}")
             continue
 
-        if record(section, target, value, name):
+        if record(section, target, value, name, "component"):
             total = quantities[section][target]
             notes.append(
                 f"«{name}» → «{target}» ({kind}), {value:g} {unit}"
