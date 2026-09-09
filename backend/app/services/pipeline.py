@@ -35,9 +35,9 @@ from .ai.schemas import (
     clean_source_type,
 )
 from .ai.client import AIClient
-from .catalog.search import CatalogSearch, stem_overlap
+from .catalog.search import CatalogSearch, normalize_unit, stem_overlap, stems
 from .docs.pdf_extract import extract_document
-from .estimate.builder import EstimateBuilder, TemplateLayout
+from .estimate.builder import EstimateBuilder, TemplateLayout, _driver_unit
 from .estimate.store import draft_from_estimate, group_by_section, save_draft
 from .rules.engine import normalize_name
 from .validation.validators import validate
@@ -575,28 +575,58 @@ def _from_analysis(
     notes: list[str] = []
     unresolved: list[dict[str, Any]] = []
 
-    driver_names = {
-        key: {normalize_name(d): d for d in layout.drivers(key)} for key in layout.order
-    }
+    search = CatalogSearch(session)
+    billing_units = {normalize_unit(i.unit) for i in search.items if i.unit}
 
     for fact in analysis.facts or []:
         if fact.get("status") in FACT_STATUSES_OUT_OF_ESTIMATE:
             continue
         value = _as_float(fact.get("value"))
         if value is None:
+            continue  # no number: a note about the site, not a quantity
+        label = str(fact.get("label", "")).strip()
+        if not label:
             continue
+        unit = str(fact.get("unit", "")).strip()
         target_section = fact.get("section")
-        label = normalize_name(str(fact.get("label", "")))
-        for key, drivers in driver_names.items():
-            if target_section and key != target_section:
-                continue
-            for norm, original in drivers.items():
-                if norm == label or label in norm or norm in label:
-                    quantities.setdefault(key, {})[original] = value
-                    if key not in sections:
-                        sections.append(key)
+        if target_section not in layout.sections:
+            target_section = None
 
-    search = CatalogSearch(session)
+        # The section comes first. "Довжина траншей (м)" is a driver of
+        # irrigation, water supply and lighting alike, so a trench length with
+        # no section attached must not be handed to whichever of them is
+        # checked first -- 66 m of irrigation trench would become 66 m of
+        # lighting trench, silently and wrongly.
+        section = target_section or _guess_section(label, layout)
+        if section is None:
+            unresolved.append({
+                "name": label, "value": value, "unit": unit,
+                "reason": "не визначено, до якої секції належить показник",
+                "origin": "fact",
+                "measure": normalize_name(unit) not in billing_units,
+            })
+            continue
+
+        # Inside that section: its own input rows first, then the catalogue --
+        # the same road a coverage row travels. A fact naming an article
+        # ("Світильник стовпець С-1, Ideal Lux 306872") is not a driver and
+        # never was.
+        article, kind, reason = _resolve_coverage_target(label, unit, section, layout, search)
+        if article is None:
+            unresolved.append({
+                "name": label, "value": value, "unit": unit, "section": section,
+                "reason": reason or "не зіставлено з жодним рядком шаблону",
+                "origin": "fact",
+                "measure": normalize_name(unit) not in billing_units,
+            })
+            notes.append(f"«{label}» ({value:g} {unit}) — {reason}")
+            continue
+
+        quantities.setdefault(section, {})[article] = value
+        if section not in sections:
+            sections.append(section)
+        notes.append(f"«{label}» → «{article}» ({kind}), {value:g} {unit}.")
+
     for entry in analysis.components or []:
         name = str(entry.get("name", "")).strip()
         value = _as_float(entry.get("quantity"))
@@ -671,6 +701,16 @@ def _guess_section(name: str, layout: TemplateLayout) -> str | None:
     return None
 
 
+# Words that say how a template row is measured, not what it measures. Two rows
+# agreeing only on one of these agree on nothing.
+_MEASURE_STEMS = {"площ", "довж", "зага", "обєм", "об'є", "кіль", "к-ть", "всьо", "сума"}
+
+
+def _identifying_overlap(driver: str, name: str) -> bool:
+    """Do the two names agree on *what* is measured, not only on how."""
+    return bool((stems(driver) - _MEASURE_STEMS) & (stems(name) - _MEASURE_STEMS))
+
+
 def _resolve_coverage_target(
     name: str,
     unit: str,
@@ -690,13 +730,56 @@ def _resolve_coverage_target(
     """
     # 1. A driver row of this section. Stem comparison, because a schedule says
     #    "Газон" where the template row is "Площа газону (рулонного)".
-    best_driver: tuple[float, str] | None = None
-    for driver in layout.drivers(section):
-        score = stem_overlap(name, driver)
-        if best_driver is None or score > best_driver[0]:
-            best_driver = (score, driver)
-    if best_driver and best_driver[0] >= 0.75:
-        return best_driver[1], "рядок-драйвер шаблону", ""
+    # Sorted on the score alone: Python's sort is stable, so drivers that tie
+    # stay in the order the workbook lists them. Sorting on the tuple broke ties
+    # alphabetically instead and sent "Бруківка 4 м²" to "Установка бруківки на
+    # клей" over "Загальна площа бруківка", purely because У follows З.
+    scored = sorted(
+        ((max(stem_overlap(name, d), stem_overlap(d, name)), d) for d in layout.drivers(section)),
+        key=lambda pair: -pair[0],
+    )
+    weak_driver: str | None = None
+    if scored:
+        best, driver = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else 0.0
+        if best >= 0.75:
+            return driver, "рядок-драйвер шаблону", ""
+        # A drawing names an input row with extra context the template omits:
+        # "Мережі поливу, L траншей" against "Довжина траншей (м)". Half the
+        # driver's own vocabulary is repeated and nothing else in the section
+        # comes close. That alone is not enough, and each guard below exists
+        # because relaxing the threshold without it placed a real figure in the
+        # wrong row on this very project:
+        #
+        #   * the agreement must survive dropping the measurement words. "Площа
+        #     озеленення 295 м²" and "Агрополотно площа (клумб)" share nothing
+        #     but "площа", and the fabric area is not the planted area — Будьків
+        #     invoiced 175 against 406;
+        #   * the row's own unit must be the fact's unit. "Плити 400х400 = 3 шт"
+        #     is a count and "Загальна площа плит" is an area in m², so 3 would
+        #     have been read as three square metres;
+        #   * and the figure must be billed in a unit this company uses at all.
+        #     "Загальна витрата форсунок 25,72 л/хв" shares the word "форсунок"
+        #     with a driver and is a flow rate; л/хв appears nowhere in the base.
+        #
+        # The row must also state its own unit and agree. Without that, "Крапельна
+        # трубка 92 м.п" landed in "Виводи під капельну трубу" — 92 metres of tube
+        # read as 92 outlets — because that row's wording names no unit at all.
+        billing = {normalize_unit(i.unit) for i in search.items if i.unit}
+        driver_unit = _driver_unit(driver)
+        if (
+            best >= 0.5
+            and (best - runner_up) >= 0.25
+            and _identifying_overlap(driver, name)
+            and unit
+            and normalize_unit(unit) in billing
+            and driver_unit
+            and normalize_unit(driver_unit) == normalize_unit(unit)
+        ):
+            # Held back rather than returned: a confident catalogue article is
+            # better evidence than half a row name, so the catalogue goes first
+            # and this is what happens if it finds nothing.
+            weak_driver = driver
 
     # 2. A catalog article. The template itself says which section an article
     #    belongs to, so a confident match in another section is placed there
@@ -711,7 +794,7 @@ def _resolve_coverage_target(
                 "",
                 f"позиція «{candidate.name}» не входить у жодну секцію шаблону",
             )
-        if unit and normalize_name(candidate.unit) != normalize_name(unit):
+        if unit and normalize_unit(candidate.unit) != normalize_unit(unit):
             return (
                 None,
                 "",
@@ -725,6 +808,11 @@ def _resolve_coverage_target(
         if home != section:
             kind = f"позиція каталогу, секція «{layout.title(home)}»"
         return candidate.name, kind, ""
+
+    # 3. No article. A template input row that half-matched and agrees on units
+    #    is now the best evidence there is.
+    if weak_driver is not None:
+        return weak_driver, "рядок-драйвер шаблону (за основами слів)", ""
 
     if match.status == "ambiguous":
         options = ", ".join(c.item.name for c in match.candidates[:3])
@@ -852,11 +940,41 @@ def _questions_from_build(
         )
 
     # Plants matched but unpriced: the client's base carries no plant prices.
+    # Where the invoices carry the plant in several sizes, the question is which
+    # size — a choice with prices on it — not "quote me a number".
+    sized = {
+        normalize_name(entry["name"]): entry for entry in getattr(result, "plant_options", [])
+    }
     for line in result.draft.lines:
         if line.block != "plants" or line.quantity <= 0 or line.unit_price > 0:
             continue
         code = f"price:{normalize_name(line.name)[:90]}"
         if code in existing:
+            continue
+        entry = sized.get(normalize_name(line.name))
+        if entry:
+            options = entry["options"]
+            session.add(
+                Question(
+                    project_id=project.id,
+                    estimate_id=estimate.id,
+                    group="Розміри рослин",
+                    code=code,
+                    text=f"Який розмір «{line.name}» закладати?",
+                    why=(
+                        "У відомості розмір не вказано, а саме він визначає ціну. "
+                        f"Ця рослина продавалась у {len(options)} варіантах — "
+                        "оберіть той, що у проєкті."
+                    ),
+                    kind="choice",
+                    choices=[
+                        f"{o['name']} — {o['unit_price']:g} грн"
+                        + (f" ({o['issued']})" if o.get("issued") else "")
+                        for o in options
+                    ],
+                    affects=[entry.get("section", "planting")],
+                )
+            )
             continue
         session.add(
             Question(

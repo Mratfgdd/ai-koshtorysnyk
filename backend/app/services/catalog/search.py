@@ -74,6 +74,21 @@ class MatchResult:
         }
 
 
+def normalize_unit(unit: str) -> str:
+    """Collapse the ways one unit of measure is written.
+
+    The price base is not consistent with itself: "м.п" on 75 rows and "м.п."
+    on one, "шт" on 595 and "шт." on one, and the drawings use both spellings
+    freely. Compared as plain strings those read as different units and a real
+    match would be refused for a trailing dot.
+
+    No case in the reference projects currently turns on this -- the mismatches
+    there are genuine, м.п of edging against an article sold by the piece -- so
+    this prevents a fault rather than fixing an observed one.
+    """
+    return normalize_name(unit).replace(".", "").replace(" ", "")
+
+
 def specs(name: str) -> set[str]:
     """Extract the size/spec tokens that must agree between two product names."""
     return {
@@ -210,7 +225,7 @@ class CatalogSearch:
                     score -= 25
                     reasons.append("характеристики не збігаються")
 
-            if unit and normalize_name(unit) == normalize_name(item.unit):
+            if unit and normalize_unit(unit) == normalize_unit(item.unit):
                 score += 6
                 reasons.append(f"одиниця виміру збігається ({item.unit})")
 

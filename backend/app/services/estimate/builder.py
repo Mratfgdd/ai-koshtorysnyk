@@ -49,6 +49,8 @@ class BuildResult:
     ambiguous: list[dict[str, Any]] = field(default_factory=list)
     # Lines whose price came from an issued proposal rather than the price base.
     repriced: list[dict[str, Any]] = field(default_factory=list)
+    # Plants the drawings named without a size, with the sizes actually sold.
+    plant_options: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -341,21 +343,48 @@ class EstimateBuilder:
             line.reasons = [r for r in [entry.get("reason")] if r]
             line.source_refs = list(entry.get("source_refs") or [])
             self._price(line, result)
-            if line.match_status != "matched" and line.unit_price <= 0:
-                line.reasons.append(
-                    "Позиції немає ні в каталозі, ні серед проданих — "
-                    "потрібно обрати аналог або внести ціну."
-                )
-            elif line.unit_price <= 0:
-                # The client's assortment sheet lists plants without prices --
-                # nursery quotes are set per project -- and this one has never
-                # been invoiced either. Flag, never guess.
-                line.confidence = "low"
-                line.reasons.append(
-                    "У базі рослин ціни не ведуться, і в історії КП ця рослина не "
-                    "зустрічається — потрібно внести ціну постачальника."
-                )
+            if line.unit_price <= 0:
+                self._offer_plant_sizes(line, result)
             draft.lines.append(line)
+
+    def _offer_plant_sizes(self, line: DraftLine, result: BuildResult) -> None:
+        """A plant with no price: say why, and say what the choice is.
+
+        A schedule that writes "Сосна гірська" with no container size has not
+        named an article — the invoices carry that plant in four sizes at four
+        prices. Guessing one invents money, so the price stays empty; but the
+        estimator should be choosing from what was actually sold, not quoting a
+        nursery from scratch.
+        """
+        options = self.prices.variants(line.name) if self.use_invoiced_prices else []
+        if options:
+            line.confidence = "low"
+            shown = ", ".join(f"{o.name} — {o.unit_price:g} грн" for o in options[:4])
+            line.reasons.append(
+                f"Розмір не вказано у відомості, а ціна залежить від нього. "
+                f"Продавалось у таких варіантах: {shown}."
+            )
+            result.plant_options.append({
+                "name": line.name,
+                "section": line.section,
+                "options": [o.to_dict() for o in options],
+            })
+            return
+
+        if line.match_status != "matched":
+            line.reasons.append(
+                "Позиції немає ні в каталозі, ні серед проданих — "
+                "потрібно обрати аналог або внести ціну."
+            )
+            return
+
+        # In the assortment sheet but never invoiced: the client's base carries
+        # no plant prices, so there is nothing to take. Flag, never guess.
+        line.confidence = "low"
+        line.reasons.append(
+            "У базі рослин ціни не ведуться, і в історії КП ця рослина не "
+            "зустрічається — потрібно внести ціну постачальника."
+        )
 
     def _add_free_line(
         self, draft: Draft, section: str, name: str, result: BuildResult

@@ -31,7 +31,7 @@ from typing import Iterable, Sequence
 
 from rapidfuzz import fuzz, process
 
-from ..catalog.search import specs, stem_overlap
+from ..catalog.search import normalize_unit, specs, stem_overlap, stems
 from ..rules.engine import normalize_name
 from .proposals import IssuedOn, Proposal, issued_on
 
@@ -219,6 +219,30 @@ class InvoicedPrices:
                 out[key] = _canonical(sales)
         return out
 
+    def variants(self, name: str, *, limit: int = 8) -> list[LastPrice]:
+        """Every article the invoices carry under this name, size by size.
+
+        "Сосна гірська" was sold four times over, as «Мопс» d30-40, «Mops»
+        d=30-60, d20-30см and d40см — four sizes at four prices. :meth:`lookup`
+        refuses that on purpose, because the size *is* the price and guessing
+        one would invent money. This is what it refused: the choice, priced,
+        so the estimator can answer it in one click instead of ringing a
+        nursery.
+
+        Matched on the words of the request being contained in the article's:
+        the request is the short name, the article adds the size to it.
+        """
+        wanted = set(stems(name))
+        if not wanted:
+            return []
+        out: list[LastPrice] = []
+        for key, sales in self._by_name.items():
+            if wanted and wanted <= set(stems(key)):
+                out.append(_canonical(sales))
+        # Cheapest first: a size list reads as a price list.
+        out.sort(key=lambda p: p.unit_price)
+        return out[:limit]
+
     # -- lookup ---------------------------------------------------------------
     def exact(self, name: str) -> LastPrice | None:
         sales = self._by_name.get(normalize_name(name))
@@ -265,8 +289,8 @@ class InvoicedPrices:
                     score -= 25
             score += 18 * stem_overlap(name, key)
             if unit:
-                units = {normalize_name(s.unit) for s in self._by_name[key]}
-                if normalize_name(unit) in units:
+                units = {normalize_unit(s.unit) for s in self._by_name[key]}
+                if normalize_unit(unit) in units:
                     score += 6
             ranked.append((score, key))
 
